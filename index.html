@@ -3,195 +3,237 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>ESP32 远程对讲终端 (v2.4 零回声版)</title>
+  <title>ESP32 广域网智能对讲终端 Pro (v3.0 互斥规避旗舰版)</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.5/mqtt.min.js"></script>
   <style>
+    :root {
+      --bg: #0b0f17;
+      --card-bg: rgba(255, 255, 255, 0.05);
+      --card-border: rgba(255, 255, 255, 0.1);
+      --primary: #3b82f6;
+      --success: #10b981;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --text-main: #f1f5f9;
+      --text-sub: #94a3b8;
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
     body {
-      background: #0b0f17;
-      color: #f1f5f9;
+      background: var(--bg);
+      color: var(--text-main);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: space-between;
-      padding: 20px 16px;
-      overflow: hidden;
+      justify-content: flex-start;
+      padding: 16px 14px 28px;
+      overflow-x: hidden;
+      overflow-y: auto;
     }
-    .header { width: 100%; max-width: 420px; text-align: center; }
-    .title { font-size: 20px; font-weight: 600; letter-spacing: 0.5px; margin-bottom: 4px; }
-    .ver-tag { font-size: 11px; color: #10b981; margin-bottom: 6px; font-weight: 500; }
+    .container { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 14px; }
+    
+    /* 顶部状态条 */
+    .top-header { text-align: center; }
+    .app-title { font-size: 20px; font-weight: 700; letter-spacing: 0.5px; }
+    .app-sub { font-size: 11px; color: var(--success); font-weight: 500; margin-top: 2px; }
+    .status-row { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
     .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 12px;
-      background: rgba(255, 255, 255, 0.08);
-      border-radius: 20px;
-      font-size: 13px;
-      color: #94a3b8;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 20px; font-size: 12px; color: var(--text-sub);
     }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
-    .dot.online { background: #10b981; box-shadow: 0 0 10px #10b981; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
+    .dot.online { background: var(--success); box-shadow: 0 0 10px var(--success); }
+    .rtt-tag { font-family: monospace; font-size: 11px; color: #38bdf8; }
 
-    .room-bar {
-      margin-top: 14px;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 8px;
+    /* 房间与信道栏 */
+    .panel {
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 14px; padding: 12px 14px; backdrop-filter: blur(10px);
     }
-    .room-input {
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 8px;
-      padding: 7px 12px;
-      color: #fff;
-      font-size: 14px;
-      text-align: center;
-      width: 140px;
-      outline: none;
+    .channel-row { display: flex; gap: 8px; align-items: center; }
+    .input-field {
+      flex: 1; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--card-border);
+      border-radius: 8px; padding: 8px 10px; color: #fff; font-size: 13px; outline: none;
     }
-    .btn-connect {
-      background: #3b82f6;
-      border: none;
-      border-radius: 8px;
-      color: #fff;
-      padding: 7px 14px;
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
+    .input-field:focus { border-color: var(--primary); }
+    .btn {
+      background: var(--primary); border: none; border-radius: 8px; color: #fff;
+      padding: 8px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+      transition: opacity 0.15s;
     }
+    .btn:active { opacity: 0.8; }
+    .btn-sm { padding: 5px 8px; font-size: 11px; border-radius: 6px; }
+    .channel-chips { display: flex; gap: 6px; margin-top: 8px; overflow-x: auto; padding-bottom: 2px; }
+    .chip {
+      padding: 3px 8px; background: rgba(255, 255, 255, 0.08); border-radius: 6px;
+      font-size: 11px; color: var(--text-sub); cursor: pointer; white-space: nowrap;
+    }
+    .chip.active { background: var(--primary); color: #fff; }
 
-    .main-stage {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      margin: auto 0;
-      position: relative;
+    /* 冲突指示与声波示波器 */
+    .status-banner {
+      min-height: 38px; display: flex; align-items: center; justify-content: center;
+      padding: 6px 12px; border-radius: 8px; font-size: 13px; font-weight: 600;
+      text-align: center; background: rgba(255,255,255,0.03); border: 1px solid var(--card-border);
+      transition: all 0.2s;
     }
+    .status-banner.idle { color: var(--text-sub); }
+    .status-banner.speaking { background: rgba(16, 185, 129, 0.15); border-color: var(--success); color: var(--success); }
+    .status-banner.locked { background: rgba(239, 68, 68, 0.18); border-color: var(--danger); color: #fca5a5; }
+    .status-banner.urgent { background: rgba(245, 158, 11, 0.2); border-color: var(--warning); color: #fde68a; }
 
-    .state-hint {
-      font-size: 15px;
-      color: #94a3b8;
-      margin-bottom: 16px;
-      letter-spacing: 0.5px;
-      min-height: 22px;
-      text-align: center;
+    .scope-box {
+      width: 100%; height: 60px; background: #05080e; border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 10px; overflow: hidden; position: relative; margin-top: 8px;
+    }
+    canvas#oscilloscope { width: 100%; height: 100%; display: block; }
+    .scope-label {
+      position: absolute; right: 6px; bottom: 4px; font-size: 10px; color: #475569;
+      font-family: monospace;
     }
 
-    .vu-meter-wrap {
-      width: 140px;
-      height: 6px;
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 3px;
-      margin-bottom: 24px;
-      overflow: hidden;
+    /* PTT 主发话核心台 */
+    .ptt-stage {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 16px 0 10px; position: relative;
     }
-    .vu-meter-bar {
-      height: 100%;
-      width: 0%;
-      background: #10b981;
-      border-radius: 3px;
-      transition: width 0.05s linear;
-    }
-
     .ptt-btn-wrapper {
-      position: relative;
-      width: 180px;
-      height: 180px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      position: relative; width: 170px; height: 170px; display: flex;
+      align-items: center; justify-content: center;
     }
     .ripple {
-      position: absolute;
-      width: 100%;
-      height: 100%;
-      border-radius: 50%;
-      background: rgba(59, 130, 246, 0.3);
-      opacity: 0;
-      transform: scale(0.9);
-      pointer-events: none;
-      transition: transform 0.2s, opacity 0.2s;
+      position: absolute; width: 100%; height: 100%; border-radius: 50%;
+      background: rgba(59, 130, 246, 0.35); opacity: 0; transform: scale(0.9);
+      pointer-events: none; transition: transform 0.2s, opacity 0.2s;
     }
     .ptt-btn {
-      width: 140px;
-      height: 140px;
-      border-radius: 50%;
+      width: 136px; height: 136px; border-radius: 50%;
       background: linear-gradient(135deg, #1e293b, #0f172a);
-      border: 3px solid #3b82f6;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 2px 4px rgba(255, 255, 255, 0.1);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      cursor: pointer;
-      touch-action: none;
-      transition: all 0.15s ease;
-      z-index: 2;
+      border: 3px solid var(--primary);
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6), inset 0 2px 4px rgba(255, 255, 255, 0.1);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 5px; cursor: pointer; touch-action: none; transition: all 0.15s ease; z-index: 2;
     }
     .ptt-btn.active {
-      transform: scale(0.94);
-      background: linear-gradient(135deg, #ef4444, #dc2626);
-      border-color: #f87171;
-      box-shadow: 0 0 35px rgba(239, 68, 68, 0.6);
+      transform: scale(0.94); background: linear-gradient(135deg, #ef4444, #dc2626);
+      border-color: #f87171; box-shadow: 0 0 35px rgba(239, 68, 68, 0.7);
+    }
+    .ptt-btn.locked {
+      background: #1e293b; border-color: #64748b; opacity: 0.55; cursor: not-allowed;
+      filter: grayscale(0.8);
     }
     .ptt-btn.active + .ripple {
-      opacity: 1;
-      transform: scale(1.35);
-      animation: pulse 1s infinite alternate ease-in-out;
+      opacity: 1; transform: scale(1.35); animation: pulse 1s infinite alternate ease-in-out;
     }
     @keyframes pulse {
-      0% { transform: scale(1.2); opacity: 0.5; }
-      100% { transform: scale(1.45); opacity: 0.15; }
+      0% { transform: scale(1.18); opacity: 0.6; }
+      100% { transform: scale(1.42); opacity: 0.15; }
     }
-
-    .mic-icon { width: 38px; height: 38px; fill: #3b82f6; transition: fill 0.15s; }
+    .mic-icon { width: 34px; height: 34px; fill: var(--primary); transition: fill 0.15s; }
     .ptt-btn.active .mic-icon { fill: #ffffff; }
-    .btn-label { font-size: 14px; font-weight: 600; color: #cbd5e1; }
+    .ptt-btn.locked .mic-icon { fill: #64748b; }
+    .btn-label { font-size: 14px; font-weight: 700; color: #cbd5e1; }
     .ptt-btn.active .btn-label { color: #ffffff; }
+    .ptt-timer { font-size: 11px; font-family: monospace; color: #94a3b8; }
+    .key-tip { font-size: 11px; color: #64748b; margin-top: 8px; }
 
-    .footer {
-      width: 100%;
-      max-width: 420px;
-      background: rgba(255, 255, 255, 0.04);
-      border-radius: 12px;
-      padding: 12px 16px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 13px;
-      color: #64748b;
+    /* 控制与调节栏（音量/增益/选项） */
+    .controls-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .slider-card {
+      background: rgba(0,0,0,0.25); border: 1px solid var(--card-border);
+      border-radius: 10px; padding: 10px;
     }
-    .footer span b { color: #cbd5e1; }
+    .slider-title { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-sub); margin-bottom: 6px; }
+    .slider { width: 100%; accent-color: var(--primary); cursor: pointer; }
+
+    /* 快捷功能按钮群 */
+    .toggles-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .toggle-pill {
+      flex: 1; min-width: 90px; padding: 6px 10px; border-radius: 8px; font-size: 12px;
+      background: rgba(255,255,255,0.04); border: 1px solid var(--card-border);
+      color: var(--text-sub); text-align: center; cursor: pointer; transition: all 0.15s;
+    }
+    .toggle-pill.on { background: rgba(59, 130, 246, 0.2); border-color: var(--primary); color: #fff; }
+
+    /* 快捷指令 TTS 播报群 */
+    .panel-tts { display: flex; flex-direction: column; }
+    .tts-box { display: flex; gap: 6px; margin-top: 6px; }
+    .quick-msg-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+    .quick-btn {
+      background: rgba(255,255,255,0.06); border: 1px solid var(--card-border);
+      color: #cbd5e1; border-radius: 6px; padding: 4px 8px; font-size: 11px; cursor: pointer;
+    }
+
+    /* 历史录音回放 */
+    .history-list { display: flex; flex-direction: column; gap: 6px; max-height: 140px; overflow-y: auto; margin-top: 6px; }
+    .history-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 6px 10px; background: rgba(0,0,0,0.3); border-radius: 6px;
+      font-size: 12px; border: 1px solid rgba(255,255,255,0.05);
+    }
+    .history-item span { color: var(--text-sub); font-family: monospace; font-size: 11px; }
+
+    /* 底部统计栏 */
+    .footer {
+      width: 100%; background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 12px; padding: 10px 14px; display: flex;
+      justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-sub);
+    }
+    .footer b { color: #f1f5f9; }
   </style>
 </head>
 <body>
 
-  <div class="header">
-    <div class="title">ESP32 广域网远程对讲</div>
-    <div class="ver-tag">● 引擎: v2.4 (零回环隔离版)</div>
-    <div class="badge">
-      <div id="statusDot" class="dot"></div>
-      <span id="statusText">正在连接公网中继...</span>
-    </div>
-
-    <div class="room-bar">
-      <input type="text" id="roomInput" class="room-input" placeholder="输入房间号" value="room101">
-      <button id="connectBtn" class="btn-connect">切换房间</button>
+<div class="container">
+  <!-- 头部信息 -->
+  <div class="top-header">
+    <div class="app-title">ESP32 广域网智能对讲终端 Pro</div>
+    <div class="app-sub">● 引擎: v3.0 互斥规避旗舰版 (Floor Control & Anti-Collision)</div>
+    <div class="status-row">
+      <div class="badge">
+        <div id="statusDot" class="dot"></div>
+        <span id="statusText">中继连接中...</span>
+      </div>
+      <div class="badge">
+        <span>终端 ID: </span><b id="myIdDisplay" style="color:#38bdf8;font-family:monospace;">----</b>
+      </div>
+      <div class="badge">
+        <span>时延 RTT: </span><span id="rttDisplay" class="rtt-tag">-- ms</span>
+      </div>
     </div>
   </div>
 
-  <div class="main-stage">
-    <div id="stateHint" class="state-hint">等待对端设备加入房间...</div>
-    <div class="vu-meter-wrap">
-      <div id="vuMeter" class="vu-meter-bar"></div>
+  <!-- 信道/房间与密钥 -->
+  <div class="panel">
+    <div class="channel-row">
+      <input type="text" id="roomInput" class="input-field" placeholder="房间/信道名 (如 room101)" value="room101">
+      <input type="password" id="pinInput" class="input-field" style="max-width: 90px;" placeholder="通信PIN(选填)">
+      <button id="connectBtn" class="btn">进入信道</button>
     </div>
+    <div class="channel-chips">
+      <span class="chip active" onclick="switchChannel('room101')">CH-1: 主信道101</span>
+      <span class="chip" onclick="switchChannel('room102')">CH-2: 工程巡检</span>
+      <span class="chip" onclick="switchChannel('room103')">CH-3: 安保应急</span>
+      <span class="chip" onclick="switchChannel('room108')">CH-8: 备用测试</span>
+    </div>
+  </div>
 
+  <!-- 信道占用冲突状态与动态示波器 -->
+  <div class="panel" style="padding: 10px 12px;">
+    <div id="statusBanner" class="status-banner idle">
+      🟢 信道空闲，随时可按住发话
+    </div>
+    <div class="scope-box">
+      <canvas id="oscilloscope"></canvas>
+      <div id="scopeMode" class="scope-label">OSC: IDLE (16kHz)</div>
+    </div>
+  </div>
+
+  <!-- PTT 主手咪台 -->
+  <div class="ptt-stage">
     <div class="ptt-btn-wrapper">
       <div id="pttButton" class="ptt-btn">
         <svg class="mic-icon" viewBox="0 0 24 24">
@@ -199,362 +241,851 @@
           <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
         </svg>
         <span id="pttText" class="btn-label">按住说话</span>
+        <span id="pttDuration" class="ptt-timer">00:00</span>
       </div>
       <div class="ripple"></div>
     </div>
+    <div class="key-tip">电脑端可长按【空格键 (Space)】发话</div>
   </div>
 
+  <!-- 音频控制（麦克风增益 / 输出音量） -->
+  <div class="controls-grid">
+    <div class="slider-card">
+      <div class="slider-title">
+        <span>话筒拾音增益</span>
+        <span id="micGainVal">1.5x</span>
+      </div>
+      <input type="range" id="micGainSlider" class="slider" min="0.5" max="4.0" step="0.1" value="1.5">
+    </div>
+    <div class="slider-card">
+      <div class="slider-title">
+        <span>接收扬声音量</span>
+        <span id="speakerVolVal">100%</span>
+      </div>
+      <input type="range" id="speakerVolSlider" class="slider" min="0" max="100" step="5" value="100">
+    </div>
+  </div>
+
+  <!-- 特性开关栏 -->
+  <div class="toggles-row">
+    <div id="toggleRoger" class="toggle-pill on" onclick="toggleFeature('roger')">📻 电台提示音 (开)</div>
+    <div id="toggleHaptic" class="toggle-pill on" onclick="toggleFeature('haptic')">📳 触感振动 (开)</div>
+    <div id="toggleMute" class="toggle-pill" onclick="toggleFeature('mute')">🔇 接收静音 (关)</div>
+    <div id="togglePriority" class="toggle-pill" onclick="toggleFeature('priority')">⚡ 紧急强插 (关)</div>
+  </div>
+
+  <!-- 文字转语音 (TTS) 快捷广播 -->
+  <div class="panel">
+    <div style="font-size: 12px; color: var(--text-sub); margin-bottom: 4px;">文字转语音远程播报 (TTS 发令):</div>
+    <div class="tts-box">
+      <input type="text" id="ttsInput" class="input-field" placeholder="输入广播文本或点击下方快捷词...">
+      <button id="sendTtsBtn" class="btn btn-sm">播报</button>
+    </div>
+    <div class="quick-msg-chips">
+      <button class="quick-btn" onclick="sendQuickTts('收到，请讲！')">收到请讲</button>
+      <button class="quick-btn" onclick="sendQuickTts('呼叫对端设备，请回答！')">呼叫对端</button>
+      <button class="quick-btn" onclick="sendQuickTts('设备运行正常，正在巡检。')">正常巡检</button>
+      <button class="quick-btn" onclick="sendQuickTts('注意，现场进入警戒状态！')">紧急警戒</button>
+    </div>
+  </div>
+
+  <!-- 历史录音回放列表 -->
+  <div class="panel">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <span style="font-size: 12px; color: var(--text-sub);">最近对讲录音回放 (本地缓存):</span>
+      <span id="historyCount" style="font-size: 11px; color: #64748b;">0 条记录</span>
+    </div>
+    <div id="historyList" class="history-list">
+      <div style="font-size: 11px; color: #475569; text-align: center; padding: 10px;">暂无历史对讲录音</div>
+    </div>
+  </div>
+
+  <!-- 底部汇总状态 -->
   <div class="footer">
-    <span id="peerCount">对端在线: <b>0</b> 台</span>
-    <span id="audioStats">链路: <b>16kHz 纯净互斥对讲</b></span>
+    <span id="peerCount">房间在线: <b>0</b> 台</span>
+    <span id="audioStats">链路: <b>16kHz 互斥仲裁保护</b></span>
   </div>
+</div>
 
-  <script>
-    // 随机客户端 ID (4 字符，如 "8e38")
-    window.myClientId = Math.random().toString(16).substring(2, 6);
-    window.mqttClient = null;
-    let audioCtx = null;
-    let micStream = null;
-    let scriptNode = null;
-    let muteNode = null; // 关键：静音增益节点，阻断麦克风声音回流扬声器
-    let isTalking = false;
-    let heartbeatTimer = null;
-    let activePeers = new Map();
+<script>
+// ==========================================
+// 1. 全局配置与状态上下文
+// ==========================================
+window.myClientId = Math.random().toString(16).substring(2, 6);
+document.getElementById("myIdDisplay").innerText = window.myClientId;
 
-    const MAGIC_0 = 0x49; // 'I'
-    const MAGIC_1 = 0x43; // 'C'
-    const HEADER_LEN = 8;
+window.mqttClient = null;
+let audioCtx = null;
+let micStream = null;
+let scriptNode = null;
+let muteNode = null;
+let micGainNode = null;
+let speakerGainNode = null;
 
-    const TARGET_SAMPLE_RATE = 16000;
-    const CHUNK_SAMPLES = 2560; // 160ms 黄金抗限流步长
-    let pcmAccumulator = new Int16Array(CHUNK_SAMPLES);
-    let pcmAccCount = 0;
-    let resamplePhase = 0.0;
+// 话语权与冲突规避状态机 (Floor Control)
+// IDLE (空闲) | REQUESTING (抢占中) | SPEAKING (正在讲话) | LOCKED_BY_PEER (对端占用)
+let floorState = "IDLE"; 
+let currentSpeakerId = null;
+let floorHoldTimer = null;
+let pttWatchdogTimer = null;
+let pttStartTime = 0;
+let pttDurationTimer = null;
 
-    // 弹性 Jitter Buffer (防抖水库)
-    let nextPlayTime = 0;
-    const JITTER_BUFFER_LEAD = 0.25;
+// 特性配置
+const config = {
+  rogerBeep: true,
+  haptic: true,
+  speakerMute: false,
+  urgentOverride: false,
+  micGain: 1.5,
+  speakerVol: 1.0,
+  maxPttSeconds: 60
+};
 
-    let currentVolLevel = 0;
-    let animFrameReq = null;
+// 链路拓扑与对端探测
+let activePeers = new Map();
+let heartbeatTimer = null;
+let pingSendTime = 0;
+let lastRtt = null;
 
-    const statusDot = document.getElementById("statusDot");
-    const statusText = document.getElementById("statusText");
-    const stateHint = document.getElementById("stateHint");
-    const roomInput = document.getElementById("roomInput");
-    const connectBtn = document.getElementById("connectBtn");
-    const pttButton = document.getElementById("pttButton");
-    const pttText = document.getElementById("pttText");
-    const peerCount = document.getElementById("peerCount");
-    const vuMeter = document.getElementById("vuMeter");
+// 录音回放缓冲池 (保留最近 5 条)
+let historyRecords = [];
+let currentRxChunks = [];
+let rxRecordTimer = null;
 
-    function initAudioContext() {
-      if (!audioCtx) {
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        audioCtx = new AudioContext();
-      }
-      if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-      }
+// 协议常量
+const MAGIC_0 = 0x49; // 'I'
+const MAGIC_1 = 0x43; // 'C'
+const HEADER_LEN = 8;
+const TARGET_SAMPLE_RATE = 16000;
+const CHUNK_SAMPLES = 2560; // 160ms 块
+let pcmAccumulator = new Int16Array(CHUNK_SAMPLES);
+let pcmAccCount = 0;
+let resamplePhase = 0.0;
+let nextPlayTime = 0;
+const JITTER_BUFFER_LEAD = 0.25;
+
+// DOM 引用
+const statusDot = document.getElementById("statusDot");
+const statusText = document.getElementById("statusText");
+const statusBanner = document.getElementById("statusBanner");
+const rttDisplay = document.getElementById("rttDisplay");
+const roomInput = document.getElementById("roomInput");
+const pinInput = document.getElementById("pinInput");
+const connectBtn = document.getElementById("connectBtn");
+const pttButton = document.getElementById("pttButton");
+const pttText = document.getElementById("pttText");
+const pttDuration = document.getElementById("pttDuration");
+const peerCount = document.getElementById("peerCount");
+const canvas = document.getElementById("oscilloscope");
+const canvasCtx = canvas.getContext("2d");
+const scopeMode = document.getElementById("scopeMode");
+const micGainSlider = document.getElementById("micGainSlider");
+const micGainVal = document.getElementById("micGainVal");
+const speakerVolSlider = document.getElementById("speakerVolSlider");
+const speakerVolVal = document.getElementById("speakerVolVal");
+const historyList = document.getElementById("historyList");
+const historyCount = document.getElementById("historyCount");
+
+// ==========================================
+// 2. 音频环境初始化与提示音系统 (Roger Beep & Web Audio)
+// ==========================================
+function initAudioContext() {
+  if (!audioCtx) {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AudioContext();
+    speakerGainNode = audioCtx.createGain();
+    speakerGainNode.gain.value = config.speakerMute ? 0.0 : config.speakerVol;
+    speakerGainNode.connect(audioCtx.destination);
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+}
+
+// 模拟经典无线电台提示音 (Roger Beep)
+function playRogerBeep(type) {
+  if (!config.rogerBeep) return;
+  initAudioContext();
+  const ctx = audioCtx;
+  const now = ctx.currentTime;
+  
+  if (type === 'start') {
+    // 按下发话：短促清脆的高音嘀 (880Hz, 40ms)
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.frequency.setValueAtTime(880, now);
+    g.gain.setValueAtTime(0.08, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+    osc.connect(g);
+    g.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.05);
+  } else if (type === 'stop') {
+    // 结束发话：电台经典双音 Roger Beep (1200Hz + 800Hz)
+    const osc1 = ctx.createOscillator();
+    const osc2 = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc1.frequency.setValueAtTime(1175, now);
+    osc2.frequency.setValueAtTime(880, now + 0.06);
+    g.gain.setValueAtTime(0.08, now);
+    g.gain.setValueAtTime(0.08, now + 0.06);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
+    osc1.connect(g);
+    osc2.connect(g);
+    g.connect(ctx.destination);
+    osc1.start(now);
+    osc1.stop(now + 0.06);
+    osc2.start(now + 0.06);
+    osc2.stop(now + 0.14);
+  } else if (type === 'busy') {
+    // 冲突拒绝/忙音 (低沉连响两声蜂鸣 300Hz)
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(280, now);
+    g.gain.setValueAtTime(0.12, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+    osc.connect(g);
+    g.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.15);
+  }
+}
+
+// 触感振动封装
+function triggerHaptic(pattern) {
+  if (!config.haptic || !navigator.vibrate) return;
+  try { navigator.vibrate(pattern); } catch (e) {}
+}
+
+// ==========================================
+// 3. 动态示波器渲染 (Canvas Oscilloscope)
+// ==========================================
+let scopeData = new Float32Array(128);
+function initOscilloscope() {
+  function resize() {
+    canvas.width = canvas.parentElement.clientWidth;
+    canvas.height = canvas.parentElement.clientHeight;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function render() {
+    requestAnimationFrame(render);
+    const w = canvas.width;
+    const h = canvas.height;
+    canvasCtx.fillStyle = '#05080e';
+    canvasCtx.fillRect(0, 0, w, h);
+
+    // 网格线
+    canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+    canvasCtx.lineWidth = 1;
+    canvasCtx.beginPath();
+    canvasCtx.moveTo(0, h / 2); canvasCtx.lineTo(w, h / 2);
+    canvasCtx.stroke();
+
+    // 波形线颜色根据状态改变
+    let strokeColor = '#10b981'; // 默认绿
+    if (floorState === 'SPEAKING') strokeColor = '#3b82f6'; // 自身说话蓝
+    else if (floorState === 'LOCKED_BY_PEER') strokeColor = '#ef4444'; // 对方占用红
+
+    canvasCtx.strokeStyle = strokeColor;
+    canvasCtx.lineWidth = 2;
+    canvasCtx.beginPath();
+
+    const sliceWidth = w / scopeData.length;
+    let x = 0;
+    for (let i = 0; i < scopeData.length; i++) {
+      const v = scopeData[i];
+      const y = (h / 2) + v * (h / 2.2);
+      if (i === 0) canvasCtx.moveTo(x, y);
+      else canvasCtx.lineTo(x, y);
+      x += sliceWidth;
     }
+    canvasCtx.stroke();
 
-    function startVuAnimation() {
-      if (!animFrameReq) {
-        const update = () => {
-          vuMeter.style.width = Math.min(100, currentVolLevel * 100) + "%";
-          currentVolLevel *= 0.85;
-          animFrameReq = requestAnimationFrame(update);
-        };
-        animFrameReq = requestAnimationFrame(update);
+    // 衰减平滑
+    for (let i = 0; i < scopeData.length; i++) {
+      scopeData[i] *= 0.88;
+    }
+  }
+  render();
+}
+
+// ==========================================
+// 4. MQTT 频道拓扑与冲突规避 (Floor Control Protocol)
+// ==========================================
+function getTopic(room, type) {
+  const pin = pinInput.value.trim();
+  const prefix = pin ? `esp32_intercom_v2/${room}_${pin}` : `esp32_intercom_v2/${room}`;
+  return `${prefix}/${type}`;
+}
+
+function connect() {
+  const room = roomInput.value.trim() || "room101";
+  const audioTopic = getTopic(room, "audio");
+  const presenceTopic = getTopic(room, "presence");
+  const controlTopic = getTopic(room, "control");
+
+  if (window.mqttClient) {
+    clearInterval(heartbeatTimer);
+    window.mqttClient.end(true);
+  }
+
+  activePeers.clear();
+  updatePeerDisplay();
+  setFloorState("IDLE");
+
+  statusText.innerText = "正在连接公网中继...";
+  statusDot.className = "dot";
+
+  const brokerUrl = "wss://broker.emqx.io:8084/mqtt";
+  window.mqttClient = mqtt.connect(brokerUrl, {
+    clientId: "mob_" + window.myClientId + "_" + Math.random().toString(16).substring(2, 6),
+    clean: true,
+    connectTimeout: 5000,
+    keepalive: 30
+  });
+
+  window.mqttClient.on("connect", function() {
+    statusText.innerText = "已就绪 (" + room + ")";
+    statusDot.className = "dot online";
+
+    window.mqttClient.subscribe([audioTopic, presenceTopic, controlTopic], { qos: 0 });
+
+    sendPresence(presenceTopic);
+    heartbeatTimer = setInterval(function() {
+      sendPresence(presenceTopic);
+      checkPeerExpiry();
+    }, 2500);
+  });
+
+  window.mqttClient.on("offline", function() {
+    statusText.innerText = "中继连接中断";
+    statusDot.className = "dot";
+    setFloorState("IDLE");
+  });
+
+  window.mqttClient.on("message", function(topic, message) {
+    if (topic === presenceTopic) {
+      handlePresenceMessage(message);
+    } else if (topic === controlTopic) {
+      handleControlMessage(message);
+    } else if (topic === audioTopic) {
+      handleAudioMessage(message);
+    }
+  });
+}
+
+// 心跳与延迟 Ping
+function sendPresence(topic) {
+  if (!window.mqttClient || !window.mqttClient.connected) return;
+  pingSendTime = Date.now();
+  const payload = JSON.stringify({ id: window.myClientId, t: pingSendTime, type: "heartbeat" });
+  window.mqttClient.publish(topic, payload, { qos: 0 });
+}
+
+function handlePresenceMessage(message) {
+  try {
+    const data = JSON.parse(message.toString());
+    if (data.id === window.myClientId) {
+      // 收到自己的回显，计算往返时延 RTT
+      if (data.t) {
+        lastRtt = Date.now() - data.t;
+        rttDisplay.innerText = lastRtt + " ms";
       }
-    }
-
-    function getAudioTopic(room) {
-      return "esp32_intercom_v2/" + room + "/audio";
-    }
-
-    function getPresenceTopic(room) {
-      return "esp32_intercom_v2/" + room + "/presence";
-    }
-
-    function connect() {
-      const room = roomInput.value.trim() || "room101";
-      const audioTopic = getAudioTopic(room);
-      const presenceTopic = getPresenceTopic(room);
-
-      if (window.mqttClient) {
-        clearInterval(heartbeatTimer);
-        window.mqttClient.end(true);
-      }
-
-      activePeers.clear();
+    } else {
+      activePeers.set(data.id, Date.now());
       updatePeerDisplay();
+    }
+  } catch (e) {}
+}
 
-      statusText.innerText = "正在连接中继...";
-      statusDot.className = "dot";
+function checkPeerExpiry() {
+  const now = Date.now();
+  for (const [id, lastTime] of activePeers.entries()) {
+    if (now - lastTime > 6000) activePeers.delete(id);
+  }
+  updatePeerDisplay();
+}
 
-      const brokerUrl = "wss://broker.emqx.io:8084/mqtt";
-      window.mqttClient = mqtt.connect(brokerUrl, {
-        clientId: "mob_" + window.myClientId + "_" + Math.random().toString(16).substring(2, 6),
-        clean: true,
-        connectTimeout: 5000,
-        keepalive: 30
-      });
+function updatePeerDisplay() {
+  const count = activePeers.size;
+  peerCount.innerHTML = "房间在线: <b>" + count + "</b> 台";
+}
 
-      window.mqttClient.on("connect", function() {
-        statusText.innerText = "已进入房间: " + room;
-        statusDot.className = "dot online";
-        stateHint.innerText = "通道已就绪，按住按钮即可说话";
+// ==========================================
+// 5. 核心：话语权仲裁与冲突规避状态机
+// ==========================================
+function setFloorState(state, info) {
+  floorState = state;
+  if (state === "IDLE") {
+    currentSpeakerId = null;
+    statusBanner.className = "status-banner idle";
+    statusBanner.innerText = "🟢 信道空闲，随时可按住发话";
+    scopeMode.innerText = "OSC: IDLE (16kHz)";
+    pttButton.classList.remove("active", "locked");
+    pttText.innerText = "按住说话";
+  } else if (state === "SPEAKING") {
+    statusBanner.className = "status-banner speaking";
+    statusBanner.innerText = "🎙️ 正在向信道播音 (您已锁定话语权)";
+    scopeMode.innerText = "OSC: TX ACTIVE";
+    pttButton.classList.add("active");
+    pttButton.classList.remove("locked");
+    pttText.innerText = "正在发话...";
+  } else if (state === "LOCKED_BY_PEER") {
+    currentSpeakerId = info?.id || "对端成员";
+    statusBanner.className = "status-banner locked";
+    statusBanner.innerText = `⛔ 成员 [${currentSpeakerId}] 正在发话，信道占用中`;
+    scopeMode.innerText = "OSC: RX OCCUPIED";
+    pttButton.classList.add("locked");
+    pttButton.classList.remove("active");
+    pttText.innerText = "信道忙";
+  }
+}
 
-        window.mqttClient.subscribe([audioTopic, presenceTopic], { qos: 0 });
+// 广播信道控制消息 (抢占/释放/强插)
+function broadcastControl(action, extra = {}) {
+  const room = roomInput.value.trim() || "room101";
+  const controlTopic = getTopic(room, "control");
+  const payload = JSON.stringify({
+    action: action, // 'request_floor' | 'release_floor' | 'urgent_takeover'
+    sender: window.myClientId,
+    timestamp: Date.now(),
+    ...extra
+  });
+  window.mqttClient.publish(controlTopic, payload, { qos: 0 });
+}
 
-        sendHeartbeat(presenceTopic);
-        heartbeatTimer = setInterval(function() {
-          sendHeartbeat(presenceTopic);
-          checkPeerExpiry();
-        }, 2500);
-      });
+function handleControlMessage(message) {
+  try {
+    const data = JSON.parse(message.toString());
+    if (data.sender === window.myClientId) return; // 忽略自己
 
-      window.mqttClient.on("offline", function() {
-        statusText.innerText = "网络离线中...";
-        statusDot.className = "dot";
-      });
-
-      window.mqttClient.on("message", function(topic, message) {
-        if (topic === presenceTopic) {
-          try {
-            const data = JSON.parse(message.toString());
-            if (data.id && data.id !== window.myClientId) {
-              activePeers.set(data.id, Date.now());
-              updatePeerDisplay();
-            }
-          } catch (e) {}
-        } else if (topic === audioTopic) {
-          // 双重保险 1：当自己正在说话时，扬声器绝对静音，不播放任何外部/回环声音
-          if (isTalking) return;
-
-          if (message.length > HEADER_LEN && message[0] === MAGIC_0 && message[1] === MAGIC_1) {
-            const senderId = new TextDecoder().decode(message.subarray(2, 6));
-            // 双重保险 2：发包者是自己时，坚决丢弃，杜绝回环
-            if (senderId !== window.myClientId) {
-              playPcmBuffer(message.subarray(HEADER_LEN));
-            }
-          }
+    if (data.action === "request_floor") {
+      // 收到他人的发话锁定广播
+      if (floorState === "SPEAKING") {
+        if (data.urgent) {
+          // 对端发起紧急强插，被迫退出
+          stopRecording(true);
+          playRogerBeep('busy');
+          setFloorState("LOCKED_BY_PEER", { id: data.sender });
         }
-      });
-    }
-
-    function sendHeartbeat(presenceTopic) {
-      if (window.mqttClient && window.mqttClient.connected) {
-        const payload = JSON.stringify({ id: window.myClientId, t: Date.now() });
-        window.mqttClient.publish(presenceTopic, payload, { qos: 0 });
-      }
-    }
-
-    function checkPeerExpiry() {
-      const now = Date.now();
-      for (const [id, lastTime] of activePeers.entries()) {
-        if (now - lastTime > 6000) {
-          activePeers.delete(id);
-        }
-      }
-      updatePeerDisplay();
-    }
-
-    function updatePeerDisplay() {
-      const count = activePeers.size;
-      peerCount.innerHTML = "对端在线: <b>" + count + "</b> 台";
-      if (count > 0) {
-        stateHint.innerText = "🟢 对端设备在线，随时可对讲！";
       } else {
-        stateHint.innerText = "等待对端设备加入相同房间...";
+        setFloorState("LOCKED_BY_PEER", { id: data.sender });
+      }
+    } else if (data.action === "release_floor") {
+      // 对端释放发话
+      if (floorState === "LOCKED_BY_PEER") {
+        setFloorState("IDLE");
       }
     }
+  } catch (e) {}
+}
 
-    // ==========================================
-    // 弹性 Jitter Buffer (消除突发延迟与断续)
-    // ==========================================
-    function playPcmBuffer(uint8Bytes) {
-      if (!audioCtx) initAudioContext();
-      if (uint8Bytes.length < 2) return;
+// ==========================================
+// 6. 音频接收与历史录音
+// ==========================================
+function handleAudioMessage(message) {
+  // 自己正在发话时彻底抛弃，杜绝回环
+  if (floorState === "SPEAKING") return;
 
-      const copy = new Uint8Array(uint8Bytes.length);
-      copy.set(uint8Bytes);
-      const int16Array = new Int16Array(copy.buffer);
-      const float32Array = new Float32Array(int16Array.length);
-
-      let peak = 0;
-      for (let i = 0; i < int16Array.length; i++) {
-        let val = int16Array[i];
-        let abs = Math.abs(val);
-        if (abs > peak) peak = abs;
-        float32Array[i] = val / 32768.0;
+  if (message.length > HEADER_LEN && message[0] === MAGIC_0 && message[1] === MAGIC_1) {
+    const senderId = new TextDecoder().decode(message.subarray(2, 6));
+    if (senderId !== window.myClientId) {
+      // 动态将状态保持在 LOCKED_BY_PEER
+      if (floorState !== "LOCKED_BY_PEER") {
+        setFloorState("LOCKED_BY_PEER", { id: senderId });
       }
+      // 重置占线保活定时器 (1.2 秒无音频包自动解开)
+      clearTimeout(floorHoldTimer);
+      floorHoldTimer = setTimeout(() => {
+        if (floorState === "LOCKED_BY_PEER") setFloorState("IDLE");
+      }, 1200);
 
-      currentVolLevel = Math.max(currentVolLevel, peak / 16000.0);
+      const pcmBytes = message.subarray(HEADER_LEN);
+      playPcmBuffer(pcmBytes);
+      bufferForHistory(pcmBytes, senderId);
+    }
+  }
+}
 
-      const audioBuffer = audioCtx.createBuffer(1, float32Array.length, TARGET_SAMPLE_RATE);
-      audioBuffer.getChannelData(0).set(float32Array);
+function playPcmBuffer(uint8Bytes) {
+  if (config.speakerMute) return;
+  initAudioContext();
+  if (uint8Bytes.length < 2) return;
 
-      const source = audioCtx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioCtx.destination);
+  const copy = new Uint8Array(uint8Bytes.length);
+  copy.set(uint8Bytes);
+  const int16Array = new Int16Array(copy.buffer);
+  const float32Array = new Float32Array(int16Array.length);
 
-      const now = audioCtx.currentTime;
-      if (nextPlayTime < now) {
-        nextPlayTime = now + JITTER_BUFFER_LEAD;
-      }
+  for (let i = 0; i < int16Array.length; i++) {
+    float32Array[i] = int16Array[i] / 32768.0;
+  }
 
-      source.start(nextPlayTime);
-      nextPlayTime += audioBuffer.duration;
+  // 写入示波器
+  const step = Math.floor(float32Array.length / scopeData.length);
+  for (let i = 0; i < scopeData.length; i++) {
+    scopeData[i] = float32Array[i * step] || 0;
+  }
+
+  const audioBuffer = audioCtx.createBuffer(1, float32Array.length, TARGET_SAMPLE_RATE);
+  audioBuffer.getChannelData(0).set(float32Array);
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(speakerGainNode);
+
+  const now = audioCtx.currentTime;
+  if (nextPlayTime < now) {
+    nextPlayTime = now + JITTER_BUFFER_LEAD;
+  }
+  source.start(nextPlayTime);
+  nextPlayTime += audioBuffer.duration;
+}
+
+// 收集音频保存为最近历史录音
+function bufferForHistory(pcmBytes, senderId) {
+  currentRxChunks.push(new Uint8Array(pcmBytes));
+  clearTimeout(rxRecordTimer);
+  rxRecordTimer = setTimeout(() => {
+    if (currentRxChunks.length > 0) {
+      saveHistoryRecord(senderId, currentRxChunks);
+      currentRxChunks = [];
+    }
+  }, 1000);
+}
+
+function saveHistoryRecord(senderId, chunks) {
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const merged = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+
+  const durationSec = (totalLen / 2 / TARGET_SAMPLE_RATE).toFixed(1);
+  const timeStr = new Date().toLocaleTimeString();
+
+  historyRecords.unshift({
+    id: Date.now(),
+    sender: senderId,
+    time: timeStr,
+    duration: durationSec,
+    data: merged
+  });
+  if (historyRecords.length > 5) historyRecords.pop();
+  renderHistoryList();
+}
+
+function renderHistoryList() {
+  historyCount.innerText = `${historyRecords.length} 条记录`;
+  if (historyRecords.length === 0) {
+    historyList.innerHTML = '<div style="font-size:11px;color:#475569;text-align:center;padding:10px;">暂无历史对讲录音</div>';
+    return;
+  }
+  historyList.innerHTML = historyRecords.map((item, idx) => `
+    <div class="history-item">
+      <div>
+        <b>[${item.sender}]</b> <span>${item.time} (${item.duration}s)</span>
+      </div>
+      <button class="btn btn-sm" onclick="replayHistory(${idx})">▶ 回放</button>
+    </div>
+  `).join('');
+}
+
+window.replayHistory = function(idx) {
+  const item = historyRecords[idx];
+  if (item) {
+    playPcmBuffer(item.data);
+    triggerHaptic([30]);
+  }
+};
+
+// ==========================================
+// 7. 发话采音与冲突仲裁流程 (PTT Engine)
+// ==========================================
+async function startRecording() {
+  initAudioContext();
+
+  if (!window.mqttClient || !window.mqttClient.connected) {
+    alert("尚未连接到公网中继，请检查网络！");
+    return;
+  }
+
+  // 冲突规避检测：若已被占用且无紧急强插权限，严禁发话
+  if (floorState === "LOCKED_BY_PEER" && !config.urgentOverride) {
+    playRogerBeep('busy');
+    triggerHaptic([100, 50, 100]);
+    statusBanner.innerText = `⚠️ 信道被 [${currentSpeakerId}] 占用，禁止抢发！`;
+    return;
+  }
+
+  // 获得话语权
+  setFloorState("SPEAKING");
+  broadcastControl("request_floor", { urgent: config.urgentOverride });
+  playRogerBeep('start');
+  triggerHaptic([40]);
+
+  // 启动发话计时与 60s 看门狗超时保护
+  pttStartTime = Date.now();
+  pttDurationTimer = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - pttStartTime) / 1000);
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(elapsed % 60).padStart(2, '0');
+    pttDuration.innerText = `${m}:${s}`;
+  }, 500);
+
+  clearTimeout(pttWatchdogTimer);
+  pttWatchdogTimer = setTimeout(() => {
+    alert(`已达到单次最长发话时限 (${config.maxPttSeconds}s)，自动释放话筒！`);
+    stopRecording();
+  }, config.maxPttSeconds * 1000);
+
+  const room = roomInput.value.trim() || "room101";
+  const audioTopic = getTopic(room, "audio");
+  pcmAccCount = 0;
+  resamplePhase = 0.0;
+
+  try {
+    if (!micStream) {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
     }
 
-    // ==========================================
-    // 麦克风采音：通过增益为 0 的静音节点阻断本地回音
-    // ==========================================
-    async function startRecording() {
-      initAudioContext();
-      startVuAnimation();
+    const source = audioCtx.createMediaStreamSource(micStream);
+    const actualRate = audioCtx.sampleRate;
+    const step = actualRate / TARGET_SAMPLE_RATE;
 
-      if (!window.mqttClient || !window.mqttClient.connected) {
-        alert("尚未连接到公网中继，请稍候...");
-        return;
-      }
+    if (!micGainNode) {
+      micGainNode = audioCtx.createGain();
+      micGainNode.gain.value = config.micGain;
+    }
 
-      const room = roomInput.value.trim() || "room101";
-      const audioTopic = getAudioTopic(room);
-      pcmAccCount = 0;
-      resamplePhase = 0.0;
+    scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
 
-      try {
-        if (!micStream) {
-          micStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              channelCount: 1,
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true
-            }
-          });
+    if (!muteNode) {
+      muteNode = audioCtx.createGain();
+      muteNode.gain.value = 0.0; // 彻底无声，阻断自己麦克风进入本地扬声器
+      muteNode.connect(audioCtx.destination);
+    }
+
+    scriptNode.onaudioprocess = function(e) {
+      if (floorState !== "SPEAKING" || !window.mqttClient || !window.mqttClient.connected) return;
+      const input = e.inputBuffer.getChannelData(0);
+
+      let inLen = input.length;
+      let idx = resamplePhase;
+
+      while (idx < inLen - 1) {
+        let i0 = Math.floor(idx);
+        let frac = idx - i0;
+        let sample = (input[i0] * (1 - frac) + input[i0 + 1] * frac) * config.micGain;
+
+        let pcmVal = sample < 0 ? (sample * 32768) : (sample * 32767);
+        pcmAccumulator[pcmAccCount++] = Math.max(-32768, Math.min(32767, pcmVal | 0));
+
+        if (pcmAccCount >= CHUNK_SAMPLES) {
+          sendAudioPacket(audioTopic, pcmAccumulator);
+          pcmAccCount = 0;
         }
 
-        const source = audioCtx.createMediaStreamSource(micStream);
-        const actualRate = audioCtx.sampleRate;
-        const step = actualRate / TARGET_SAMPLE_RATE;
-
-        scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
-
-        // 核心消除自己声音的关键：静音增益节点 (Gain = 0)
-        // 既保持 ScriptProcessor 能够正常回调，又彻底切断向本地扬声器的音频通路！
-        if (!muteNode) {
-          muteNode = audioCtx.createGain();
-          muteNode.gain.value = 0.0; // 彻底无声
-          muteNode.connect(audioCtx.destination);
-        }
-
-        scriptNode.onaudioprocess = function(e) {
-          if (!isTalking || !window.mqttClient || !window.mqttClient.connected) return;
-          const input = e.inputBuffer.getChannelData(0);
-
-          let peak = 0;
-          let inLen = input.length;
-          let idx = resamplePhase;
-
-          while (idx < inLen - 1) {
-            let i0 = Math.floor(idx);
-            let frac = idx - i0;
-            let sample = input[i0] * (1 - frac) + input[i0 + 1] * frac;
-
-            let abs = Math.abs(sample);
-            if (abs > peak) peak = abs;
-
-            let pcmVal = sample < 0 ? (sample * 32768) : (sample * 32767);
-            pcmAccumulator[pcmAccCount++] = Math.max(-32768, Math.min(32767, pcmVal | 0));
-
-            if (pcmAccCount >= CHUNK_SAMPLES) {
-              sendChunk(audioTopic);
-              pcmAccCount = 0;
-            }
-
-            idx += step;
-          }
-
-          resamplePhase = idx - inLen;
-          currentVolLevel = Math.max(currentVolLevel, peak * 1.5);
-        };
-
-        // 连入静音节点，杜绝任何本地监听回声
-        source.connect(scriptNode);
-        scriptNode.connect(muteNode);
-
-        isTalking = true;
-        pttButton.classList.add("active");
-        pttText.innerText = "正在发话...";
-        stateHint.innerText = "正在讲话，松开发送完毕";
-      } catch (err) {
-        alert("获取麦克风权限失败: " + err.message);
-      }
-    }
-
-    function sendChunk(audioTopic) {
-      const packet = new Uint8Array(HEADER_LEN + pcmAccumulator.byteLength);
-      packet[0] = MAGIC_0;
-      packet[1] = MAGIC_1;
-      const idBytes = new TextEncoder().encode(window.myClientId.substring(0, 4));
-      packet.set(idBytes, 2);
-      packet.set(new Uint8Array(pcmAccumulator.buffer), HEADER_LEN);
-
-      window.mqttClient.publish(audioTopic, packet, { qos: 0 });
-    }
-
-    function stopRecording() {
-      if (!isTalking) return;
-      isTalking = false;
-      pttButton.classList.remove("active");
-      pttText.innerText = "按住说话";
-      stateHint.innerText = "松开完毕，等待对端发话";
-
-      if (pcmAccCount > 0 && window.mqttClient && window.mqttClient.connected) {
-        const room = roomInput.value.trim() || "room101";
-        const audioTopic = getAudioTopic(room);
-        const tail = pcmAccumulator.slice(0, pcmAccCount);
-
-        const packet = new Uint8Array(HEADER_LEN + tail.byteLength);
-        packet[0] = MAGIC_0;
-        packet[1] = MAGIC_1;
-        const idBytes = new TextEncoder().encode(window.myClientId.substring(0, 4));
-        packet.set(idBytes, 2);
-        packet.set(new Uint8Array(tail.buffer), HEADER_LEN);
-
-        window.mqttClient.publish(audioTopic, packet, { qos: 0 });
-        pcmAccCount = 0;
+        idx += step;
       }
 
-      if (scriptNode) {
-        scriptNode.disconnect();
-        scriptNode = null;
+      resamplePhase = idx - inLen;
+
+      // 实时采样写入示波器
+      const scStep = Math.floor(inLen / scopeData.length);
+      for (let i = 0; i < scopeData.length; i++) {
+        scopeData[i] = input[i * scStep] || 0;
       }
-    }
+    };
 
-    pttButton.addEventListener("mousedown", function(e) { e.preventDefault(); startRecording(); });
-    window.addEventListener("mouseup", function(e) { stopRecording(); });
+    source.connect(micGainNode);
+    micGainNode.connect(scriptNode);
+    scriptNode.connect(muteNode);
 
-    pttButton.addEventListener("touchstart", function(e) { e.preventDefault(); startRecording(); }, { passive: false });
-    window.addEventListener("touchend", function(e) { stopRecording(); });
-    window.addEventListener("touchcancel", function(e) { stopRecording(); });
+  } catch (err) {
+    alert("获取麦克风失败: " + err.message);
+    setFloorState("IDLE");
+  }
+}
 
-    connectBtn.addEventListener("click", function() {
-      connect();
-    });
+function sendAudioPacket(audioTopic, int16Data) {
+  const packet = new Uint8Array(HEADER_LEN + int16Data.byteLength);
+  packet[0] = MAGIC_0;
+  packet[1] = MAGIC_1;
+  const idBytes = new TextEncoder().encode(window.myClientId.substring(0, 4));
+  packet.set(idBytes, 2);
+  packet.set(new Uint8Array(int16Data.buffer), HEADER_LEN);
 
-    const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.has("room")) {
-      roomInput.value = urlParams.get("room");
-    }
+  window.mqttClient.publish(audioTopic, packet, { qos: 0 });
+}
 
-    window.addEventListener("DOMContentLoaded", function() {
-      connect();
-    });
-  </script>
+function stopRecording(force = false) {
+  if (floorState !== "SPEAKING") return;
+
+  clearInterval(pttDurationTimer);
+  clearTimeout(pttWatchdogTimer);
+  pttDuration.innerText = "00:00";
+
+  // 发送残余尾包
+  if (pcmAccCount > 0 && window.mqttClient && window.mqttClient.connected) {
+    const room = roomInput.value.trim() || "room101";
+    const audioTopic = getTopic(room, "audio");
+    const tail = pcmAccumulator.slice(0, pcmAccCount);
+    sendAudioPacket(audioTopic, tail);
+    pcmAccCount = 0;
+  }
+
+  if (scriptNode) {
+    scriptNode.disconnect();
+    scriptNode = null;
+  }
+
+  // 释放信道
+  broadcastControl("release_floor");
+  setFloorState("IDLE");
+
+  if (!force) {
+    playRogerBeep('stop');
+    triggerHaptic([30, 30]);
+  }
+}
+
+// ==========================================
+// 8. 文字转语音 (TTS) 快捷广播生成器
+// ==========================================
+window.sendQuickTts = function(text) {
+  document.getElementById("ttsInput").value = text;
+  document.getElementById("sendTtsBtn").click();
+};
+
+document.getElementById("sendTtsBtn").addEventListener("click", () => {
+  const text = document.getElementById("ttsInput").value.trim();
+  if (!text) return;
+  if (floorState === "LOCKED_BY_PEER" && !config.urgentOverride) {
+    alert("信道正在被占用，暂无法广播！");
+    return;
+  }
+
+  initAudioContext();
+  if ('speechSynthesis' in window) {
+    // 抢占信道
+    setFloorState("SPEAKING");
+    broadcastControl("request_floor", { urgent: config.urgentOverride });
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'zh-CN';
+    utterance.rate = 1.0;
+
+    utterance.onend = () => {
+      stopRecording();
+    };
+    window.speechSynthesis.speak(utterance);
+    statusBanner.innerText = `📢 正在播报 TTS 文本: "${text}"`;
+  } else {
+    alert("当前浏览器不支持原生 Web Speech TTS");
+  }
+});
+
+// ==========================================
+// 9. 事件绑定与特性控制
+// ==========================================
+// 键盘空格键 PTT
+let isSpaceDown = false;
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && !isSpaceDown && document.activeElement.tagName !== "INPUT") {
+    e.preventDefault();
+    isSpaceDown = true;
+    startRecording();
+  }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space" && isSpaceDown) {
+    e.preventDefault();
+    isSpaceDown = false;
+    stopRecording();
+  }
+});
+
+// 鼠标/触控 PTT
+pttButton.addEventListener("mousedown", (e) => { e.preventDefault(); startRecording(); });
+window.addEventListener("mouseup", () => { stopRecording(); });
+pttButton.addEventListener("touchstart", (e) => { e.preventDefault(); startRecording(); }, { passive: false });
+window.addEventListener("touchend", () => { stopRecording(); });
+window.addEventListener("touchcancel", () => { stopRecording(); });
+
+// 信道切换
+window.switchChannel = function(ch) {
+  roomInput.value = ch;
+  document.querySelectorAll(".chip").forEach(c => c.classList.remove("active"));
+  event.target.classList.add("active");
+  connect();
+};
+
+connectBtn.addEventListener("click", connect);
+
+// 特性开关
+window.toggleFeature = function(feat) {
+  if (feat === 'roger') {
+    config.rogerBeep = !config.rogerBeep;
+    const el = document.getElementById("toggleRoger");
+    el.className = `toggle-pill ${config.rogerBeep ? 'on' : ''}`;
+    el.innerText = `📻 电台提示音 (${config.rogerBeep ? '开' : '关'})`;
+  } else if (feat === 'haptic') {
+    config.haptic = !config.haptic;
+    const el = document.getElementById("toggleHaptic");
+    el.className = `toggle-pill ${config.haptic ? 'on' : ''}`;
+    el.innerText = `📳 触感振动 (${config.haptic ? '开' : '关'})`;
+  } else if (feat === 'mute') {
+    config.speakerMute = !config.speakerMute;
+    if (speakerGainNode) speakerGainNode.gain.value = config.speakerMute ? 0.0 : config.speakerVol;
+    const el = document.getElementById("toggleMute");
+    el.className = `toggle-pill ${config.speakerMute ? 'on' : ''}`;
+    el.innerText = `🔇 接收静音 (${config.speakerMute ? '开' : '关'})`;
+  } else if (feat === 'priority') {
+    config.urgentOverride = !config.urgentOverride;
+    const el = document.getElementById("togglePriority");
+    el.className = `toggle-pill ${config.urgentOverride ? 'on' : ''}`;
+    el.innerText = `⚡ 紧急强插 (${config.urgentOverride ? '开' : '关'})`;
+  }
+};
+
+// 滑块事件
+micGainSlider.addEventListener("input", (e) => {
+  config.micGain = parseFloat(e.target.value);
+  micGainVal.innerText = config.micGain.toFixed(1) + "x";
+  if (micGainNode) micGainNode.gain.value = config.micGain;
+});
+
+speakerVolSlider.addEventListener("input", (e) => {
+  config.speakerVol = parseInt(e.target.value) / 100.0;
+  speakerVolVal.innerText = e.target.value + "%";
+  if (speakerGainNode && !config.speakerMute) speakerGainNode.gain.value = config.speakerVol;
+});
+
+// URL 参数自动解析
+const urlParams = new URLSearchParams(window.location.search);
+if (urlParams.has("room")) roomInput.value = urlParams.get("room");
+if (urlParams.has("pin")) pinInput.value = urlParams.get("pin");
+
+// 初始化启动
+window.addEventListener("DOMContentLoaded", () => {
+  initOscilloscope();
+  connect();
+});
+</script>
 </body>
 </html>
