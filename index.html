@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>ESP32 广域网智能对讲终端 Pro (v3.1 零丢包高抗抖黄金版)</title>
+  <title>ESP32 广域网智能对讲终端 Pro (v3.2 原生16k极速对讲版)</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.5/mqtt.min.js"></script>
   <style>
     :root {
@@ -191,7 +191,7 @@
   <!-- 头部信息 -->
   <div class="top-header">
     <div class="app-title">ESP32 广域网智能对讲终端 Pro</div>
-    <div class="app-sub">● 引擎: v3.1 零丢包高抗抖黄金版 (200ms Flow Control & Jitter Shield)</div>
+    <div class="app-sub">● 引擎: v3.2 原生16k极速对讲版 (Native 16kHz Direct & Low-Lag Shield)</div>
     <div class="status-row">
       <div class="badge">
         <div id="statusDot" class="dot"></div>
@@ -392,8 +392,12 @@ const historyCount = document.getElementById("historyCount");
 // ==========================================
 function initAudioContext() {
   if (!audioCtx) {
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    audioCtx = new AudioContext();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    try {
+      audioCtx = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
+    } catch (e) {
+      audioCtx = new AudioContextClass();
+    }
     speakerGainNode = audioCtx.createGain();
     speakerGainNode.gain.value = config.speakerMute ? 0.0 : config.speakerVol;
     speakerGainNode.connect(audioCtx.destination);
@@ -698,11 +702,11 @@ function handleAudioMessage(message) {
       if (floorState !== "LOCKED_BY_PEER") {
         setFloorState("LOCKED_BY_PEER", { id: senderId });
       }
-      // 重置占线保活定时器 (1.2 秒无音频包自动解开)
+      // 重置占线保活定时器 (350ms 无音频包自动解开，双方极速交接顺畅回话)
       clearTimeout(floorHoldTimer);
       floorHoldTimer = setTimeout(() => {
         if (floorState === "LOCKED_BY_PEER") setFloorState("IDLE");
-      }, 1200);
+      }, 350);
 
       const pcmBytes = message.subarray(HEADER_LEN);
       playPcmBuffer(pcmBytes);
@@ -739,8 +743,9 @@ function playPcmBuffer(uint8Bytes) {
   source.connect(speakerGainNode);
 
   const now = audioCtx.currentTime;
-  if (nextPlayTime < now) {
-    nextPlayTime = now + JITTER_BUFFER_LEAD;
+  // 自适应紧咬时延：超 380ms 瞬时收敛到 180ms，杜绝延迟膨胀滚雪球与断续
+  if (nextPlayTime < now || (nextPlayTime - now) > 0.38) {
+    nextPlayTime = now + 0.18;
   }
   source.start(nextPlayTime);
   nextPlayTime += audioBuffer.duration;
@@ -876,34 +881,47 @@ async function startRecording() {
 
     if (!muteNode) {
       muteNode = audioCtx.createGain();
-      muteNode.gain.value = 0.0; // 彻底无声，阻断自己麦克风进入本地扬声器
+      muteNode.gain.value = 0.00001; // 极微电平防 iOS Safari 采音休眠假死
       muteNode.connect(audioCtx.destination);
     }
 
     scriptNode.onaudioprocess = function(e) {
       if (floorState !== "SPEAKING" || !window.mqttClient || !window.mqttClient.connected) return;
       const input = e.inputBuffer.getChannelData(0);
+      const inLen = input.length;
+      const actualRate = audioCtx.sampleRate;
 
-      let inLen = input.length;
-      let idx = resamplePhase;
+      if (actualRate === TARGET_SAMPLE_RATE) {
+        // 原生 16kHz 直通无损采样：彻底根除手机端插值漂移与慢动作说话
+        for (let i = 0; i < inLen; i++) {
+          let sample = input[i] * config.micGain;
+          let pcmVal = sample < 0 ? (sample * 32768) : (sample * 32767);
+          pcmAccumulator[pcmAccCount++] = Math.max(-32768, Math.min(32767, pcmVal | 0));
 
-      while (idx < inLen - 1) {
-        let i0 = Math.floor(idx);
-        let frac = idx - i0;
-        let sample = (input[i0] * (1 - frac) + input[i0 + 1] * frac) * config.micGain;
-
-        let pcmVal = sample < 0 ? (sample * 32768) : (sample * 32767);
-        pcmAccumulator[pcmAccCount++] = Math.max(-32768, Math.min(32767, pcmVal | 0));
-
-        if (pcmAccCount >= CHUNK_SAMPLES) {
-          sendAudioPacket(audioTopic, pcmAccumulator);
-          pcmAccCount = 0;
+          if (pcmAccCount >= CHUNK_SAMPLES) {
+            sendAudioPacket(audioTopic, pcmAccumulator);
+            pcmAccCount = 0;
+          }
         }
+      } else {
+        // 兼容重采样兜底模式
+        const step = actualRate / TARGET_SAMPLE_RATE;
+        let idx = resamplePhase;
+        while (idx < inLen - 1) {
+          let i0 = Math.floor(idx);
+          let frac = idx - i0;
+          let sample = (input[i0] * (1 - frac) + input[i0 + 1] * frac) * config.micGain;
+          let pcmVal = sample < 0 ? (sample * 32768) : (sample * 32767);
+          pcmAccumulator[pcmAccCount++] = Math.max(-32768, Math.min(32767, pcmVal | 0));
 
-        idx += step;
+          if (pcmAccCount >= CHUNK_SAMPLES) {
+            sendAudioPacket(audioTopic, pcmAccumulator);
+            pcmAccCount = 0;
+          }
+          idx += step;
+        }
+        resamplePhase = idx - inLen;
       }
-
-      resamplePhase = idx - inLen;
 
       // 实时采样写入示波器
       const scStep = Math.floor(inLen / scopeData.length);
