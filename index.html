@@ -183,11 +183,25 @@
       justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-sub);
     }
     .footer b { color: #f1f5f9; }
+
+    /* 移动端免提音频激活横幅 */
+    .unlock-banner {
+      width: 100%; background: linear-gradient(135deg, #f59e0b, #d97706);
+      color: #0b0f17; font-weight: 700; font-size: 13px; text-align: center;
+      padding: 10px 14px; border-radius: 10px; cursor: pointer;
+      box-shadow: 0 4px 15px rgba(245, 158, 11, 0.4);
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
   </style>
 </head>
 <body>
 
 <div class="container">
+  <!-- 移动端音频未激活提示条 -->
+  <div id="audioUnlockBanner" class="unlock-banner" style="display:none;" onclick="unlockAudio()">
+    🔊 <span>检测到系统收听静音中，<b>点此立即激活免提收听</b></span>
+  </div>
+
   <!-- 头部信息 -->
   <div class="top-header">
     <div class="app-title">ESP32 广域网智能对讲终端 Pro</div>
@@ -307,7 +321,7 @@
   </div>
 </div>
 
-<div id="remoteAudiosContainer" style="display:none;"></div>
+<div id="remoteAudiosContainer" style="position:fixed; left:0; bottom:0; width:1px; height:1px; opacity:0.01; overflow:hidden; pointer-events:none;"></div>
 
 <script>
 // ==========================================
@@ -326,14 +340,16 @@ let micGainNode = null;
 let speakerGainNode = null;
 let analyserNode = null;
 
-// WebRTC P2P 会话池与 STUN 打洞配置
+// WebRTC P2P 会话池与 STUN 打洞配置 (国内秒级极速节点与抗对称穿透)
 let rtcPeers = new Map(); // peerId -> RTCPeerConnection
 const rtcConfig = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.qq.com:3478' },
+    { urls: 'stun:stun.miwifi.com:3478' },
+    { urls: 'stun:stun.chat.bilibili.com:3478' },
     { urls: 'stun:stun.cloudflare.com:3478' }
-  ]
+  ],
+  iceCandidatePoolSize: 2
 };
 
 // 话语权与冲突规避状态机 (Floor Control)
@@ -682,10 +698,13 @@ async function ensureLocalMic() {
       localAudioTrack = mediaStreamDest.stream.getAudioTracks()[0];
       localAudioTrack.enabled = false;
 
-      // 为已有 WebRTC Peer 挂载音轨
+      // 为已有 WebRTC Peer 挂载音轨 (使用 replaceTrack 毫秒级无缝注入)
       rtcPeers.forEach(pc => {
-        if (!pc.getSenders().some(s => s.track === localAudioTrack)) {
-          pc.addTrack(localAudioTrack, mediaStreamDest.stream);
+        const sender = pc.getSenders().find(s => s.track === null || (s.track && s.track.kind === 'audio'));
+        if (sender) {
+          sender.replaceTrack(localAudioTrack).catch(e => console.warn("replaceTrack failed:", e));
+        } else {
+          try { pc.addTrack(localAudioTrack, mediaStreamDest.stream); } catch(e){}
         }
       });
 
@@ -705,6 +724,9 @@ function createPeerConnection(peerId, isInitiator) {
 
   if (localAudioTrack && mediaStreamDest) {
     pc.addTrack(localAudioTrack, mediaStreamDest.stream);
+  } else {
+    // 提前创建双向音频收发器，使 SDP 拥有音轨能力
+    try { pc.addTransceiver('audio', { direction: 'sendrecv' }); } catch(e){}
   }
 
   // ICE 候选打洞交换
@@ -797,6 +819,32 @@ async function handleWebRtcSignal(message) {
   } catch (e) {}
 }
 
+function showAudioUnlockBanner() {
+  const b = document.getElementById("audioUnlockBanner");
+  if (b) b.style.display = "flex";
+}
+function hideAudioUnlockBanner() {
+  const b = document.getElementById("audioUnlockBanner");
+  if (b) b.style.display = "none";
+}
+
+function unlockAudio() {
+  initAudioContext();
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+  hideAudioUnlockBanner();
+
+  const container = document.getElementById("remoteAudiosContainer");
+  if (container) {
+    container.querySelectorAll("audio").forEach(a => {
+      if (a.srcObject) {
+        a.play().catch(() => {});
+      }
+    });
+  }
+}
+
 function attachRemoteAudio(peerId, stream) {
   let audioEl = document.getElementById("audio_" + peerId);
   if (!audioEl) {
@@ -804,15 +852,34 @@ function attachRemoteAudio(peerId, stream) {
     audioEl.id = "audio_" + peerId;
     audioEl.autoplay = true;
     audioEl.playsInline = true;
-    remoteAudiosContainer.appendChild(audioEl);
+    audioEl.setAttribute('playsinline', '');
+    audioEl.setAttribute('webkit-playsinline', '');
+    document.getElementById("remoteAudiosContainer").appendChild(audioEl);
   }
   audioEl.srcObject = stream;
   audioEl.volume = config.speakerMute ? 0.0 : config.speakerVol;
-  audioEl.play().catch(err => {
-    console.warn("Autoplay was prevented:", err);
-  });
 
-  // 将对端音频导入示波器 (连接到 analyserNode，不进 destination，杜绝重音)
+  // 关键优化：实时追平，如果缓冲区落后超过 0.35s 瞬间跳到当前实时末尾，杜绝时延堆积与延后播放
+  audioEl.onplay = () => {
+    if (audioEl.buffered.length > 0) {
+      const end = audioEl.buffered.end(audioEl.buffered.length - 1);
+      if (end - audioEl.currentTime > 0.35) {
+        audioEl.currentTime = end;
+      }
+    }
+  };
+
+  const playPromise = audioEl.play();
+  if (playPromise !== undefined) {
+    playPromise.then(() => {
+      hideAudioUnlockBanner();
+    }).catch(err => {
+      console.warn("自动播放受限，等待用户交互解锁:", err);
+      showAudioUnlockBanner();
+    });
+  }
+
+  // 将对端音频导入示波器 (连接到 analyserNode)
   initAudioContext();
   try {
     const remoteSource = audioCtx.createMediaStreamSource(stream);
@@ -1216,7 +1283,9 @@ speakerVolSlider.addEventListener("input", (e) => {
   config.speakerVol = parseInt(e.target.value) / 100.0;
   speakerVolVal.innerText = e.target.value + "%";
   if (speakerGainNode && !config.speakerMute) speakerGainNode.gain.value = config.speakerVol;
-  remoteAudiosContainer.querySelectorAll("audio").forEach(a => a.volume = config.speakerMute ? 0.0 : config.speakerVol);
+  document.querySelectorAll("#remoteAudiosContainer audio").forEach(a => {
+    a.volume = config.speakerMute ? 0.0 : config.speakerVol;
+  });
 });
 
 // URL 参数自动解析
@@ -1224,10 +1293,20 @@ const urlParams = new URLSearchParams(window.location.search);
 if (urlParams.has("room")) roomInput.value = urlParams.get("room");
 if (urlParams.has("pin")) pinInput.value = urlParams.get("pin");
 
+// 全屏触控免提音频解锁监听
+window.addEventListener("touchstart", unlockAudio, { passive: true });
+window.addEventListener("touchend", unlockAudio, { passive: true });
+window.addEventListener("click", unlockAudio);
+
 // 初始化启动
 window.addEventListener("DOMContentLoaded", () => {
   initOscilloscope();
   connect();
+  setTimeout(() => {
+    if (!audioCtx || audioCtx.state === 'suspended') {
+      showAudioUnlockBanner();
+    }
+  }, 1000);
 });
 </script>
 </body>
