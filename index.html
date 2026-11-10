@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>ESP32 广域网智能对讲终端 Pro (v3.2 原生16k极速对讲版)</title>
+  <title>ESP32 广域网智能对讲终端 Pro (v4.0 工业级 WebRTC VoIP 旗舰版)</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.5/mqtt.min.js"></script>
   <style>
     :root {
@@ -191,7 +191,7 @@
   <!-- 头部信息 -->
   <div class="top-header">
     <div class="app-title">ESP32 广域网智能对讲终端 Pro</div>
-    <div class="app-sub">● 引擎: v3.2 原生16k极速对讲版 (Native 16kHz Direct & Low-Lag Shield)</div>
+    <div class="app-sub">● 引擎: v4.0 工业级 WebRTC VoIP 旗舰版 (Ultra-HD Opus & P2P NetEQ)</div>
     <div class="status-row">
       <div class="badge">
         <div id="statusDot" class="dot"></div>
@@ -228,7 +228,7 @@
     </div>
     <div class="scope-box">
       <canvas id="oscilloscope"></canvas>
-      <div id="scopeMode" class="scope-label">OSC: IDLE (16kHz)</div>
+      <div id="scopeMode" class="scope-label">OSC: IDLE (WebRTC Opus)</div>
     </div>
   </div>
 
@@ -303,13 +303,15 @@
   <!-- 底部汇总状态 -->
   <div class="footer">
     <span id="peerCount">房间在线: <b>0</b> 台</span>
-    <span id="audioStats">链路: <b>16kHz 互斥仲裁保护</b></span>
+    <span id="audioStats">链路: <b>WebRTC Opus 工业级 VoIP</b></span>
   </div>
 </div>
 
+<div id="remoteAudiosContainer" style="display:none;"></div>
+
 <script>
 // ==========================================
-// 1. 全局配置与状态上下文
+// 1. 全局配置与状态上下文 (v4.0 WebRTC VoIP)
 // ==========================================
 window.myClientId = Math.random().toString(16).substring(2, 6);
 document.getElementById("myIdDisplay").innerText = window.myClientId;
@@ -317,10 +319,22 @@ document.getElementById("myIdDisplay").innerText = window.myClientId;
 window.mqttClient = null;
 let audioCtx = null;
 let micStream = null;
+let localAudioTrack = null;
 let scriptNode = null;
 let muteNode = null;
 let micGainNode = null;
 let speakerGainNode = null;
+let analyserNode = null;
+
+// WebRTC P2P 会话池与 STUN 打洞配置
+let rtcPeers = new Map(); // peerId -> RTCPeerConnection
+const rtcConfig = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' }
+  ]
+};
 
 // 话语权与冲突规避状态机 (Floor Control)
 // IDLE (空闲) | REQUESTING (抢占中) | SPEAKING (正在讲话) | LOCKED_BY_PEER (对端占用)
@@ -350,20 +364,8 @@ let lastRtt = null;
 
 // 录音回放缓冲池 (保留最近 5 条)
 let historyRecords = [];
-let currentRxChunks = [];
-let rxRecordTimer = null;
-
-// 协议常量
-const MAGIC_0 = 0x49; // 'I'
-const MAGIC_1 = 0x43; // 'C'
-const HEADER_LEN = 8;
-const TARGET_SAMPLE_RATE = 16000;
-const CHUNK_SAMPLES = 3200; // 200ms 黄金分包 (规避公网限流0丢包)
-let pcmAccumulator = new Int16Array(CHUNK_SAMPLES);
-let pcmAccCount = 0;
-let resamplePhase = 0.0;
-let nextPlayTime = 0;
-const JITTER_BUFFER_LEAD = 0.35; // 350ms 抗抖动缓冲池深度
+let mediaRecorder = null;
+let recordedBlobs = [];
 
 // DOM 引用
 const statusDot = document.getElementById("statusDot");
@@ -386,6 +388,7 @@ const speakerVolSlider = document.getElementById("speakerVolSlider");
 const speakerVolVal = document.getElementById("speakerVolVal");
 const historyList = document.getElementById("historyList");
 const historyCount = document.getElementById("historyCount");
+const remoteAudiosContainer = document.getElementById("remoteAudiosContainer");
 
 // ==========================================
 // 2. 音频环境初始化与提示音系统 (Roger Beep & Web Audio)
@@ -394,13 +397,18 @@ function initAudioContext() {
   if (!audioCtx) {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     try {
-      audioCtx = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
+      audioCtx = new AudioContextClass();
     } catch (e) {
       audioCtx = new AudioContextClass();
     }
+
     speakerGainNode = audioCtx.createGain();
     speakerGainNode.gain.value = config.speakerMute ? 0.0 : config.speakerVol;
     speakerGainNode.connect(audioCtx.destination);
+
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 256;
+    // analyserNode 作为纯波形监听，不直连 destination，防止回音与重音
   }
   if (audioCtx.state === 'suspended') {
     audioCtx.resume();
@@ -426,7 +434,7 @@ function playRogerBeep(type) {
     osc.start(now);
     osc.stop(now + 0.05);
   } else if (type === 'stop') {
-    // 结束发话：电台经典双音 Roger Beep (1200Hz + 800Hz)
+    // 结束发话：电台经典双音 Roger Beep (1175Hz + 880Hz)
     const osc1 = ctx.createOscillator();
     const osc2 = ctx.createOscillator();
     const g = ctx.createGain();
@@ -443,7 +451,7 @@ function playRogerBeep(type) {
     osc2.start(now + 0.06);
     osc2.stop(now + 0.14);
   } else if (type === 'busy') {
-    // 冲突拒绝/忙音 (低沉连响两声蜂鸣 300Hz)
+    // 冲突拒绝/忙音 (低沉连响两声蜂鸣 280Hz)
     const osc = ctx.createOscillator();
     const g = ctx.createGain();
     osc.type = 'sawtooth';
@@ -466,7 +474,7 @@ function triggerHaptic(pattern) {
 // ==========================================
 // 3. 动态示波器渲染 (Canvas Oscilloscope)
 // ==========================================
-let scopeData = new Float32Array(128);
+let scopeData = new Uint8Array(128);
 function initOscilloscope() {
   function resize() {
     canvas.width = canvas.parentElement.clientWidth;
@@ -482,14 +490,17 @@ function initOscilloscope() {
     canvasCtx.fillStyle = '#05080e';
     canvasCtx.fillRect(0, 0, w, h);
 
-    // 网格线
+    // 网格参考线
     canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
     canvasCtx.lineWidth = 1;
     canvasCtx.beginPath();
     canvasCtx.moveTo(0, h / 2); canvasCtx.lineTo(w, h / 2);
     canvasCtx.stroke();
 
-    // 波形线颜色根据状态改变
+    if (analyserNode) {
+      analyserNode.getByteTimeDomainData(scopeData);
+    }
+
     let strokeColor = '#10b981'; // 默认绿
     if (floorState === 'SPEAKING') strokeColor = '#3b82f6'; // 自身说话蓝
     else if (floorState === 'LOCKED_BY_PEER') strokeColor = '#ef4444'; // 对方占用红
@@ -501,24 +512,19 @@ function initOscilloscope() {
     const sliceWidth = w / scopeData.length;
     let x = 0;
     for (let i = 0; i < scopeData.length; i++) {
-      const v = scopeData[i];
+      const v = (scopeData[i] - 128) / 128.0;
       const y = (h / 2) + v * (h / 2.2);
       if (i === 0) canvasCtx.moveTo(x, y);
       else canvasCtx.lineTo(x, y);
       x += sliceWidth;
     }
     canvasCtx.stroke();
-
-    // 衰减平滑
-    for (let i = 0; i < scopeData.length; i++) {
-      scopeData[i] *= 0.88;
-    }
   }
   render();
 }
 
 // ==========================================
-// 4. MQTT 频道拓扑与冲突规避 (Floor Control Protocol)
+// 4. MQTT 信令交换通道 (Signaling for WebRTC)
 // ==========================================
 function getTopic(room, type) {
   const pin = pinInput.value.trim();
@@ -528,20 +534,23 @@ function getTopic(room, type) {
 
 function connect() {
   const room = roomInput.value.trim() || "room101";
-  const audioTopic = getTopic(room, "audio");
   const presenceTopic = getTopic(room, "presence");
   const controlTopic = getTopic(room, "control");
+  const signalTopic = getTopic(room, "signal");
 
   if (window.mqttClient) {
     clearInterval(heartbeatTimer);
     window.mqttClient.end(true);
   }
 
+  // 关闭旧 WebRTC 连接
+  rtcPeers.forEach(pc => { try { pc.close(); } catch(e){} });
+  rtcPeers.clear();
   activePeers.clear();
   updatePeerDisplay();
   setFloorState("IDLE");
 
-  statusText.innerText = "正在连接公网中继...";
+  statusText.innerText = "正在接入信令中继...";
   statusDot.className = "dot";
 
   const brokerUrl = "wss://broker.emqx.io:8084/mqtt";
@@ -552,21 +561,27 @@ function connect() {
     keepalive: 30
   });
 
-  window.mqttClient.on("connect", function() {
-    statusText.innerText = "已就绪 (" + room + ")";
+  const audioTopic = getTopic(room, "audio");
+
+  window.mqttClient.on("connect", async function() {
+    statusText.innerText = "VoIP 就绪 (" + room + ")";
     statusDot.className = "dot online";
 
-    window.mqttClient.subscribe([audioTopic, presenceTopic, controlTopic], { qos: 0 });
+    window.mqttClient.subscribe([presenceTopic, controlTopic, signalTopic, audioTopic], { qos: 0 });
 
-    sendPresence(presenceTopic);
+    // 预热麦克风硬件管线
+    await ensureLocalMic();
+
+    // 广播进入房间信令
+    sendPresence(presenceTopic, "join");
     heartbeatTimer = setInterval(function() {
-      sendPresence(presenceTopic);
+      sendPresence(presenceTopic, "heartbeat");
       checkPeerExpiry();
     }, 2500);
   });
 
   window.mqttClient.on("offline", function() {
-    statusText.innerText = "中继连接中断";
+    statusText.innerText = "信令中断";
     statusDot.className = "dot";
     setFloorState("IDLE");
   });
@@ -576,17 +591,19 @@ function connect() {
       handlePresenceMessage(message);
     } else if (topic === controlTopic) {
       handleControlMessage(message);
+    } else if (topic === signalTopic) {
+      handleWebRtcSignal(message);
     } else if (topic === audioTopic) {
       handleAudioMessage(message);
     }
   });
 }
 
-// 心跳与延迟 Ping
-function sendPresence(topic) {
+// 心跳与对端上线探测
+function sendPresence(topic, type = "heartbeat") {
   if (!window.mqttClient || !window.mqttClient.connected) return;
   pingSendTime = Date.now();
-  const payload = JSON.stringify({ id: window.myClientId, t: pingSendTime, type: "heartbeat" });
+  const payload = JSON.stringify({ id: window.myClientId, t: pingSendTime, type: type });
   window.mqttClient.publish(topic, payload, { qos: 0 });
 }
 
@@ -594,14 +611,21 @@ function handlePresenceMessage(message) {
   try {
     const data = JSON.parse(message.toString());
     if (data.id === window.myClientId) {
-      // 收到自己的回显，计算往返时延 RTT
       if (data.t) {
         lastRtt = Date.now() - data.t;
         rttDisplay.innerText = lastRtt + " ms";
       }
     } else {
+      const isNew = !activePeers.has(data.id);
       activePeers.set(data.id, Date.now());
       updatePeerDisplay();
+
+      // 发现新成员且自己 ID 较大（避免冲突），发起 WebRTC P2P 打洞
+      if (isNew || data.type === "join") {
+        if (window.myClientId > data.id) {
+          createPeerConnection(data.id, true);
+        }
+      }
     }
   } catch (e) {}
 }
@@ -609,7 +633,15 @@ function handlePresenceMessage(message) {
 function checkPeerExpiry() {
   const now = Date.now();
   for (const [id, lastTime] of activePeers.entries()) {
-    if (now - lastTime > 6000) activePeers.delete(id);
+    if (now - lastTime > 6000) {
+      activePeers.delete(id);
+      if (rtcPeers.has(id)) {
+        try { rtcPeers.get(id).close(); } catch(e){}
+        rtcPeers.delete(id);
+      }
+      const el = document.getElementById("audio_" + id);
+      if (el) el.remove();
+    }
   }
   updatePeerDisplay();
 }
@@ -620,89 +652,191 @@ function updatePeerDisplay() {
 }
 
 // ==========================================
-// 5. 核心：话语权仲裁与冲突规避状态机
+// 5. 工业级 WebRTC VoIP 媒体连接引擎 & PCM 兼容层
 // ==========================================
-function setFloorState(state, info) {
-  floorState = state;
-  if (state === "IDLE") {
-    currentSpeakerId = null;
-    statusBanner.className = "status-banner idle";
-    statusBanner.innerText = "🟢 信道空闲，随时可按住发话";
-    scopeMode.innerText = "OSC: IDLE (16kHz)";
-    pttButton.classList.remove("active", "locked");
-    pttText.innerText = "按住说话";
-  } else if (state === "SPEAKING") {
-    statusBanner.className = "status-banner speaking";
-    statusBanner.innerText = "🎙️ 正在向信道播音 (您已锁定话语权)";
-    scopeMode.innerText = "OSC: TX ACTIVE";
-    pttButton.classList.add("active");
-    pttButton.classList.remove("locked");
-    pttText.innerText = "正在发话...";
-  } else if (state === "LOCKED_BY_PEER") {
-    currentSpeakerId = info?.id || "对端成员";
-    statusBanner.className = "status-banner locked";
-    statusBanner.innerText = `⛔ 成员 [${currentSpeakerId}] 正在发话，信道占用中`;
-    scopeMode.innerText = "OSC: RX OCCUPIED";
-    pttButton.classList.add("locked");
-    pttButton.classList.remove("active");
-    pttText.innerText = "信道忙";
+let mediaStreamDest = null;
+let pendingCandidates = new Map();
+
+async function ensureLocalMic() {
+  initAudioContext();
+  if (!micStream) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      const source = audioCtx.createMediaStreamSource(micStream);
+      micGainNode = audioCtx.createGain();
+      micGainNode.gain.value = config.micGain;
+
+      mediaStreamDest = audioCtx.createMediaStreamDestination();
+      source.connect(micGainNode);
+      micGainNode.connect(mediaStreamDest);
+      micGainNode.connect(analyserNode);
+
+      localAudioTrack = mediaStreamDest.stream.getAudioTracks()[0];
+      localAudioTrack.enabled = false;
+
+      // 为已有 WebRTC Peer 挂载音轨
+      rtcPeers.forEach(pc => {
+        if (!pc.getSenders().some(s => s.track === localAudioTrack)) {
+          pc.addTrack(localAudioTrack, mediaStreamDest.stream);
+        }
+      });
+
+    } catch (err) {
+      console.warn("请求麦克风失败:", err);
+    }
   }
 }
 
-// 广播信道控制消息 (抢占/释放/强插)
-function broadcastControl(action, extra = {}) {
-  const room = roomInput.value.trim() || "room101";
-  const controlTopic = getTopic(room, "control");
-  const payload = JSON.stringify({
-    action: action, // 'request_floor' | 'release_floor' | 'urgent_takeover'
-    sender: window.myClientId,
-    timestamp: Date.now(),
-    ...extra
-  });
-  window.mqttClient.publish(controlTopic, payload, { qos: 0 });
+function createPeerConnection(peerId, isInitiator) {
+  if (rtcPeers.has(peerId)) {
+    try { rtcPeers.get(peerId).close(); } catch(e){}
+  }
+
+  const pc = new RTCPeerConnection(rtcConfig);
+  rtcPeers.set(peerId, pc);
+
+  if (localAudioTrack && mediaStreamDest) {
+    pc.addTrack(localAudioTrack, mediaStreamDest.stream);
+  }
+
+  // ICE 候选打洞交换
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendWebRtcSignal(peerId, { type: 'candidate', candidate: event.candidate });
+    }
+  };
+
+  // 接收对端 Opus 高清音频流
+  pc.ontrack = (event) => {
+    const remoteStream = event.streams[0] || new MediaStream([event.track]);
+    attachRemoteAudio(peerId, remoteStream);
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') {
+      scopeMode.innerText = "OSC: WebRTC P2P (Opus HD)";
+    }
+  };
+
+  if (isInitiator) {
+    pc.createOffer({ offerToReceiveAudio: true }).then(offer => {
+      return pc.setLocalDescription(offer);
+    }).then(() => {
+      sendWebRtcSignal(peerId, { type: 'offer', sdp: pc.localDescription });
+    }).catch(err => console.error("CreateOffer 失败:", err));
+  }
+
+  return pc;
 }
 
-function handleControlMessage(message) {
-  try {
-    const data = JSON.parse(message.toString());
-    if (data.sender === window.myClientId) return; // 忽略自己
+function sendWebRtcSignal(targetId, data) {
+  if (!window.mqttClient || !window.mqttClient.connected) return;
+  const room = roomInput.value.trim() || "room101";
+  const signalTopic = getTopic(room, "signal");
+  const msg = JSON.stringify({
+    from: window.myClientId,
+    to: targetId,
+    data: data
+  });
+  window.mqttClient.publish(signalTopic, msg, { qos: 0 });
+}
 
-    if (data.action === "request_floor") {
-      // 收到他人的发话锁定广播
-      if (floorState === "SPEAKING") {
-        if (data.urgent) {
-          // 对端发起紧急强插，被迫退出
-          stopRecording(true);
-          playRogerBeep('busy');
-          setFloorState("LOCKED_BY_PEER", { id: data.sender });
+async function handleWebRtcSignal(message) {
+  try {
+    const payload = JSON.parse(message.toString());
+    if (payload.to !== window.myClientId) return; // 仅处理发向本终端的信令
+
+    const fromId = payload.from;
+    const signalData = payload.data;
+    let pc = rtcPeers.get(fromId);
+
+    if (signalData.type === 'offer') {
+      if (!pc) pc = createPeerConnection(fromId, false);
+      await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
+
+      // 消费待处理的 ICE candidates
+      if (pendingCandidates.has(fromId)) {
+        for (const c of pendingCandidates.get(fromId)) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
         }
-      } else {
-        setFloorState("LOCKED_BY_PEER", { id: data.sender });
+        pendingCandidates.delete(fromId);
       }
-    } else if (data.action === "release_floor") {
-      // 对端释放发话
-      if (floorState === "LOCKED_BY_PEER") {
-        setFloorState("IDLE");
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      sendWebRtcSignal(fromId, { type: 'answer', sdp: pc.localDescription });
+
+    } else if (signalData.type === 'answer') {
+      if (pc) {
+        await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
+        if (pendingCandidates.has(fromId)) {
+          for (const c of pendingCandidates.get(fromId)) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+          }
+          pendingCandidates.delete(fromId);
+        }
+      }
+    } else if (signalData.type === 'candidate') {
+      if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
+        } catch (e) {}
+      } else {
+        if (!pendingCandidates.has(fromId)) pendingCandidates.set(fromId, []);
+        pendingCandidates.get(fromId).push(signalData.candidate);
       }
     }
   } catch (e) {}
 }
 
-// ==========================================
-// 6. 音频接收与历史录音
-// ==========================================
-function handleAudioMessage(message) {
-  // 自己正在发话时彻底抛弃，杜绝回环
-  if (floorState === "SPEAKING") return;
+function attachRemoteAudio(peerId, stream) {
+  let audioEl = document.getElementById("audio_" + peerId);
+  if (!audioEl) {
+    audioEl = document.createElement("audio");
+    audioEl.id = "audio_" + peerId;
+    audioEl.autoplay = true;
+    audioEl.playsInline = true;
+    remoteAudiosContainer.appendChild(audioEl);
+  }
+  audioEl.srcObject = stream;
+  audioEl.volume = config.speakerMute ? 0.0 : config.speakerVol;
+  audioEl.play().catch(err => {
+    console.warn("Autoplay was prevented:", err);
+  });
 
+  // 将对端音频导入示波器 (连接到 analyserNode，不进 destination，杜绝重音)
+  initAudioContext();
+  try {
+    const remoteSource = audioCtx.createMediaStreamSource(stream);
+    remoteSource.connect(analyserNode);
+  } catch (e) {}
+}
+
+// ==========================================
+// 5.1 ESP32 硬件裸 PCM 音频兼容接收层
+// ==========================================
+const MAGIC_0 = 0x49; // 'I'
+const MAGIC_1 = 0x43; // 'C'
+const HEADER_LEN = 8;
+const TARGET_SAMPLE_RATE = 16000;
+let nextPlayTime = 0;
+
+function handleAudioMessage(message) {
+  if (floorState === "SPEAKING") return;
   if (message.length > HEADER_LEN && message[0] === MAGIC_0 && message[1] === MAGIC_1) {
     const senderId = new TextDecoder().decode(message.subarray(2, 6));
     if (senderId !== window.myClientId) {
-      // 动态将状态保持在 LOCKED_BY_PEER
       if (floorState !== "LOCKED_BY_PEER") {
         setFloorState("LOCKED_BY_PEER", { id: senderId });
       }
-      // 重置占线保活定时器 (350ms 无音频包自动解开，双方极速交接顺畅回话)
       clearTimeout(floorHoldTimer);
       floorHoldTimer = setTimeout(() => {
         if (floorState === "LOCKED_BY_PEER") setFloorState("IDLE");
@@ -710,7 +844,6 @@ function handleAudioMessage(message) {
 
       const pcmBytes = message.subarray(HEADER_LEN);
       playPcmBuffer(pcmBytes);
-      bufferForHistory(pcmBytes, senderId);
     }
   }
 }
@@ -729,59 +862,205 @@ function playPcmBuffer(uint8Bytes) {
     float32Array[i] = int16Array[i] / 32768.0;
   }
 
-  // 写入示波器
-  const step = Math.floor(float32Array.length / scopeData.length);
-  for (let i = 0; i < scopeData.length; i++) {
-    scopeData[i] = float32Array[i * step] || 0;
-  }
-
   const audioBuffer = audioCtx.createBuffer(1, float32Array.length, TARGET_SAMPLE_RATE);
   audioBuffer.getChannelData(0).set(float32Array);
 
   const source = audioCtx.createBufferSource();
   source.buffer = audioBuffer;
   source.connect(speakerGainNode);
+  source.connect(analyserNode);
 
   const now = audioCtx.currentTime;
-  // 自适应紧咬时延：超 380ms 瞬时收敛到 180ms，杜绝延迟膨胀滚雪球与断续
   if (nextPlayTime < now || (nextPlayTime - now) > 0.38) {
-    nextPlayTime = now + 0.18;
+    nextPlayTime = now + 0.05;
   }
   source.start(nextPlayTime);
   nextPlayTime += audioBuffer.duration;
 }
 
-// 收集音频保存为最近历史录音
-function bufferForHistory(pcmBytes, senderId) {
-  currentRxChunks.push(new Uint8Array(pcmBytes));
-  clearTimeout(rxRecordTimer);
-  rxRecordTimer = setTimeout(() => {
-    if (currentRxChunks.length > 0) {
-      saveHistoryRecord(senderId, currentRxChunks);
-      currentRxChunks = [];
-    }
-  }, 1000);
+// ==========================================
+// 6. 核心：话语权仲裁与冲突规避状态机
+// ==========================================
+function setFloorState(state, info) {
+  floorState = state;
+  if (state === "IDLE") {
+    currentSpeakerId = null;
+    statusBanner.className = "status-banner idle";
+    statusBanner.innerText = "🟢 信道空闲，随时可按住发话";
+    scopeMode.innerText = "OSC: IDLE (WebRTC Opus)";
+    pttButton.classList.remove("active", "locked");
+    pttText.innerText = "按住说话";
+  } else if (state === "SPEAKING") {
+    statusBanner.className = "status-banner speaking";
+    statusBanner.innerText = "🎙️ 正在向信道播音 (您已锁定话语权)";
+    scopeMode.innerText = "OSC: TX ACTIVE (Opus HD)";
+    pttButton.classList.add("active");
+    pttButton.classList.remove("locked");
+    pttText.innerText = "正在发话...";
+  } else if (state === "LOCKED_BY_PEER") {
+    currentSpeakerId = info?.id || "对端成员";
+    statusBanner.className = "status-banner locked";
+    statusBanner.innerText = `⛔ 成员 [${currentSpeakerId}] 正在发话，信道占用中`;
+    scopeMode.innerText = "OSC: RX OCCUPIED";
+    pttButton.classList.add("locked");
+    pttButton.classList.remove("active");
+    pttText.innerText = "信道忙";
+  }
 }
 
-function saveHistoryRecord(senderId, chunks) {
-  let totalLen = 0;
-  for (const c of chunks) totalLen += c.length;
-  const merged = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.length;
+function broadcastControl(action, extra = {}) {
+  const room = roomInput.value.trim() || "room101";
+  const controlTopic = getTopic(room, "control");
+  const payload = JSON.stringify({
+    action: action, // 'request_floor' | 'release_floor' | 'urgent_takeover'
+    sender: window.myClientId,
+    timestamp: Date.now(),
+    ...extra
+  });
+  window.mqttClient.publish(controlTopic, payload, { qos: 0 });
+}
+
+function handleControlMessage(message) {
+  try {
+    const data = JSON.parse(message.toString());
+    if (data.sender === window.myClientId) return;
+
+    if (data.action === "request_floor") {
+      if (floorState === "SPEAKING") {
+        if (data.urgent) {
+          stopRecording(true);
+          playRogerBeep('busy');
+          setFloorState("LOCKED_BY_PEER", { id: data.sender });
+        }
+      } else {
+        setFloorState("LOCKED_BY_PEER", { id: data.sender });
+      }
+      // 3秒无续期安全看门狗保底自动解开
+      clearTimeout(floorHoldTimer);
+      floorHoldTimer = setTimeout(() => {
+        if (floorState === "LOCKED_BY_PEER") setFloorState("IDLE");
+      }, 3500);
+
+    } else if (data.action === "release_floor") {
+      clearTimeout(floorHoldTimer);
+      if (floorState === "LOCKED_BY_PEER") {
+        setFloorState("IDLE"); // 瞬间释放，无缝回话接话
+      }
+    }
+  } catch (e) {}
+}
+
+// ==========================================
+// 7. 发话与 PTT 控制核心 (WebRTC Track Gate)
+// ==========================================
+async function startRecording() {
+  initAudioContext();
+  await ensureLocalMic();
+
+  if (!window.mqttClient || !window.mqttClient.connected) {
+    alert("尚未连接到公网信令中继，请检查网络！");
+    return;
   }
 
-  const durationSec = (totalLen / 2 / TARGET_SAMPLE_RATE).toFixed(1);
+  // 冲突规避：信道占用则拒发
+  if (floorState === "LOCKED_BY_PEER" && !config.urgentOverride) {
+    playRogerBeep('busy');
+    triggerHaptic([100, 50, 100]);
+    statusBanner.innerText = `⚠️ 信道被 [${currentSpeakerId}] 占用，禁止抢发！`;
+    return;
+  }
+
+  // 锁定发话权
+  setFloorState("SPEAKING");
+  broadcastControl("request_floor", { urgent: config.urgentOverride });
+  playRogerBeep('start');
+  triggerHaptic([40]);
+
+  // 毫秒级门控：立即激活本地 Opus 音轨，直达所有 P2P 终端
+  if (localAudioTrack) {
+    localAudioTrack.enabled = true;
+  }
+
+  // 启动本地录音回放缓存
+  startLocalHistoryRecording();
+
+  // 启动发话计时与 60s 保护看门狗
+  pttStartTime = Date.now();
+  pttDurationTimer = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - pttStartTime) / 1000);
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(elapsed % 60).padStart(2, '0');
+    pttDuration.innerText = `${m}:${s}`;
+  }, 500);
+
+  clearTimeout(pttWatchdogTimer);
+  pttWatchdogTimer = setTimeout(() => {
+    alert(`已达到最长发话时限 (${config.maxPttSeconds}s)，自动释放话筒！`);
+    stopRecording();
+  }, config.maxPttSeconds * 1000);
+}
+
+function stopRecording(force = false) {
+  if (floorState !== "SPEAKING") return;
+
+  clearInterval(pttDurationTimer);
+  clearTimeout(pttWatchdogTimer);
+  pttDuration.innerText = "00:00";
+
+  // 毫秒级门控：立即静音本地 Opus 音轨，彻底掐断发声
+  if (localAudioTrack) {
+    localAudioTrack.enabled = false;
+  }
+
+  // 结束本地录音回放缓存
+  stopLocalHistoryRecording();
+
+  // 立即广播释放话语权信令
+  broadcastControl("release_floor");
+  setFloorState("IDLE");
+
+  if (!force) {
+    playRogerBeep('stop');
+    triggerHaptic([30, 30]);
+  }
+}
+
+// 录音回放缓冲逻辑
+function startLocalHistoryRecording() {
+  if (!micStream) return;
+  try {
+    recordedBlobs = [];
+    mediaRecorder = new MediaRecorder(micStream);
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedBlobs.push(e.data);
+    };
+    mediaRecorder.onstop = () => {
+      if (recordedBlobs.length > 0) {
+        const blob = new Blob(recordedBlobs, { type: 'audio/webm' });
+        saveHistoryRecord(window.myClientId, blob);
+      }
+    };
+    mediaRecorder.start();
+  } catch (e) {}
+}
+
+function stopLocalHistoryRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+}
+
+function saveHistoryRecord(senderId, blob) {
+  const url = URL.createObjectURL(blob);
   const timeStr = new Date().toLocaleTimeString();
+  const durSec = ((Date.now() - pttStartTime) / 1000).toFixed(1);
 
   historyRecords.unshift({
     id: Date.now(),
     sender: senderId,
     time: timeStr,
-    duration: durationSec,
-    data: merged
+    duration: durSec,
+    audioUrl: url
   });
   if (historyRecords.length > 5) historyRecords.pop();
   renderHistoryList();
@@ -805,182 +1084,13 @@ function renderHistoryList() {
 
 window.replayHistory = function(idx) {
   const item = historyRecords[idx];
-  if (item) {
-    playPcmBuffer(item.data);
+  if (item && item.audioUrl) {
+    const a = new Audio(item.audioUrl);
+    a.volume = config.speakerMute ? 0.0 : config.speakerVol;
+    a.play();
     triggerHaptic([30]);
   }
 };
-
-// ==========================================
-// 7. 发话采音与冲突仲裁流程 (PTT Engine)
-// ==========================================
-async function startRecording() {
-  initAudioContext();
-
-  if (!window.mqttClient || !window.mqttClient.connected) {
-    alert("尚未连接到公网中继，请检查网络！");
-    return;
-  }
-
-  // 冲突规避检测：若已被占用且无紧急强插权限，严禁发话
-  if (floorState === "LOCKED_BY_PEER" && !config.urgentOverride) {
-    playRogerBeep('busy');
-    triggerHaptic([100, 50, 100]);
-    statusBanner.innerText = `⚠️ 信道被 [${currentSpeakerId}] 占用，禁止抢发！`;
-    return;
-  }
-
-  // 获得话语权
-  setFloorState("SPEAKING");
-  broadcastControl("request_floor", { urgent: config.urgentOverride });
-  playRogerBeep('start');
-  triggerHaptic([40]);
-
-  // 启动发话计时与 60s 看门狗超时保护
-  pttStartTime = Date.now();
-  pttDurationTimer = setInterval(() => {
-    const elapsed = Math.floor((Date.now() - pttStartTime) / 1000);
-    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
-    const s = String(elapsed % 60).padStart(2, '0');
-    pttDuration.innerText = `${m}:${s}`;
-  }, 500);
-
-  clearTimeout(pttWatchdogTimer);
-  pttWatchdogTimer = setTimeout(() => {
-    alert(`已达到单次最长发话时限 (${config.maxPttSeconds}s)，自动释放话筒！`);
-    stopRecording();
-  }, config.maxPttSeconds * 1000);
-
-  const room = roomInput.value.trim() || "room101";
-  const audioTopic = getTopic(room, "audio");
-  pcmAccCount = 0;
-  resamplePhase = 0.0;
-
-  try {
-    if (!micStream) {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-    }
-
-    const source = audioCtx.createMediaStreamSource(micStream);
-    const actualRate = audioCtx.sampleRate;
-    const step = actualRate / TARGET_SAMPLE_RATE;
-
-    if (!micGainNode) {
-      micGainNode = audioCtx.createGain();
-      micGainNode.gain.value = config.micGain;
-    }
-
-    scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
-
-    if (!muteNode) {
-      muteNode = audioCtx.createGain();
-      muteNode.gain.value = 0.00001; // 极微电平防 iOS Safari 采音休眠假死
-      muteNode.connect(audioCtx.destination);
-    }
-
-    scriptNode.onaudioprocess = function(e) {
-      if (floorState !== "SPEAKING" || !window.mqttClient || !window.mqttClient.connected) return;
-      const input = e.inputBuffer.getChannelData(0);
-      const inLen = input.length;
-      const actualRate = audioCtx.sampleRate;
-
-      if (actualRate === TARGET_SAMPLE_RATE) {
-        // 原生 16kHz 直通无损采样：彻底根除手机端插值漂移与慢动作说话
-        for (let i = 0; i < inLen; i++) {
-          let sample = input[i] * config.micGain;
-          let pcmVal = sample < 0 ? (sample * 32768) : (sample * 32767);
-          pcmAccumulator[pcmAccCount++] = Math.max(-32768, Math.min(32767, pcmVal | 0));
-
-          if (pcmAccCount >= CHUNK_SAMPLES) {
-            sendAudioPacket(audioTopic, pcmAccumulator);
-            pcmAccCount = 0;
-          }
-        }
-      } else {
-        // 兼容重采样兜底模式
-        const step = actualRate / TARGET_SAMPLE_RATE;
-        let idx = resamplePhase;
-        while (idx < inLen - 1) {
-          let i0 = Math.floor(idx);
-          let frac = idx - i0;
-          let sample = (input[i0] * (1 - frac) + input[i0 + 1] * frac) * config.micGain;
-          let pcmVal = sample < 0 ? (sample * 32768) : (sample * 32767);
-          pcmAccumulator[pcmAccCount++] = Math.max(-32768, Math.min(32767, pcmVal | 0));
-
-          if (pcmAccCount >= CHUNK_SAMPLES) {
-            sendAudioPacket(audioTopic, pcmAccumulator);
-            pcmAccCount = 0;
-          }
-          idx += step;
-        }
-        resamplePhase = idx - inLen;
-      }
-
-      // 实时采样写入示波器
-      const scStep = Math.floor(inLen / scopeData.length);
-      for (let i = 0; i < scopeData.length; i++) {
-        scopeData[i] = input[i * scStep] || 0;
-      }
-    };
-
-    source.connect(micGainNode);
-    micGainNode.connect(scriptNode);
-    scriptNode.connect(muteNode);
-
-  } catch (err) {
-    alert("获取麦克风失败: " + err.message);
-    setFloorState("IDLE");
-  }
-}
-
-function sendAudioPacket(audioTopic, int16Data) {
-  const packet = new Uint8Array(HEADER_LEN + int16Data.byteLength);
-  packet[0] = MAGIC_0;
-  packet[1] = MAGIC_1;
-  const idBytes = new TextEncoder().encode(window.myClientId.substring(0, 4));
-  packet.set(idBytes, 2);
-  packet.set(new Uint8Array(int16Data.buffer), HEADER_LEN);
-
-  window.mqttClient.publish(audioTopic, packet, { qos: 0 });
-}
-
-function stopRecording(force = false) {
-  if (floorState !== "SPEAKING") return;
-
-  clearInterval(pttDurationTimer);
-  clearTimeout(pttWatchdogTimer);
-  pttDuration.innerText = "00:00";
-
-  // 发送残余尾包
-  if (pcmAccCount > 0 && window.mqttClient && window.mqttClient.connected) {
-    const room = roomInput.value.trim() || "room101";
-    const audioTopic = getTopic(room, "audio");
-    const tail = pcmAccumulator.slice(0, pcmAccCount);
-    sendAudioPacket(audioTopic, tail);
-    pcmAccCount = 0;
-  }
-
-  if (scriptNode) {
-    scriptNode.disconnect();
-    scriptNode = null;
-  }
-
-  // 释放信道
-  broadcastControl("release_floor");
-  setFloorState("IDLE");
-
-  if (!force) {
-    playRogerBeep('stop');
-    triggerHaptic([30, 30]);
-  }
-}
 
 // ==========================================
 // 8. 文字转语音 (TTS) 快捷广播生成器
@@ -1000,7 +1110,6 @@ document.getElementById("sendTtsBtn").addEventListener("click", () => {
 
   initAudioContext();
   if ('speechSynthesis' in window) {
-    // 抢占信道
     setFloorState("SPEAKING");
     broadcastControl("request_floor", { urgent: config.urgentOverride });
 
@@ -1039,9 +1148,19 @@ window.addEventListener("keyup", (e) => {
 });
 
 // 鼠标/触控 PTT
-pttButton.addEventListener("mousedown", (e) => { e.preventDefault(); startRecording(); });
+pttButton.addEventListener("mousedown", async (e) => {
+  e.preventDefault();
+  initAudioContext();
+  await ensureLocalMic();
+  startRecording();
+});
 window.addEventListener("mouseup", () => { stopRecording(); });
-pttButton.addEventListener("touchstart", (e) => { e.preventDefault(); startRecording(); }, { passive: false });
+pttButton.addEventListener("touchstart", async (e) => {
+  e.preventDefault();
+  initAudioContext();
+  await ensureLocalMic();
+  startRecording();
+}, { passive: false });
 window.addEventListener("touchend", () => { stopRecording(); });
 window.addEventListener("touchcancel", () => { stopRecording(); });
 
@@ -1053,7 +1172,11 @@ window.switchChannel = function(ch) {
   connect();
 };
 
-connectBtn.addEventListener("click", connect);
+connectBtn.addEventListener("click", async () => {
+  initAudioContext();
+  await ensureLocalMic();
+  connect();
+});
 
 // 特性开关
 window.toggleFeature = function(feat) {
@@ -1070,6 +1193,7 @@ window.toggleFeature = function(feat) {
   } else if (feat === 'mute') {
     config.speakerMute = !config.speakerMute;
     if (speakerGainNode) speakerGainNode.gain.value = config.speakerMute ? 0.0 : config.speakerVol;
+    remoteAudiosContainer.querySelectorAll("audio").forEach(a => a.volume = config.speakerMute ? 0.0 : config.speakerVol);
     const el = document.getElementById("toggleMute");
     el.className = `toggle-pill ${config.speakerMute ? 'on' : ''}`;
     el.innerText = `🔇 接收静音 (${config.speakerMute ? '开' : '关'})`;
@@ -1092,6 +1216,7 @@ speakerVolSlider.addEventListener("input", (e) => {
   config.speakerVol = parseInt(e.target.value) / 100.0;
   speakerVolVal.innerText = e.target.value + "%";
   if (speakerGainNode && !config.speakerMute) speakerGainNode.gain.value = config.speakerVol;
+  remoteAudiosContainer.querySelectorAll("audio").forEach(a => a.volume = config.speakerMute ? 0.0 : config.speakerVol);
 });
 
 // URL 参数自动解析
