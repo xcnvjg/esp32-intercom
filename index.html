@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>ESP32 广域网智能对讲终端 Pro (v3.0 互斥规避旗舰版)</title>
+  <title>ESP32 广域网智能对讲终端 Pro (v3.1 零丢包高抗抖黄金版)</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.5/mqtt.min.js"></script>
   <style>
     :root {
@@ -191,7 +191,7 @@
   <!-- 头部信息 -->
   <div class="top-header">
     <div class="app-title">ESP32 广域网智能对讲终端 Pro</div>
-    <div class="app-sub">● 引擎: v3.0 互斥规避旗舰版 (Floor Control & Anti-Collision)</div>
+    <div class="app-sub">● 引擎: v3.1 零丢包高抗抖黄金版 (200ms Flow Control & Jitter Shield)</div>
     <div class="status-row">
       <div class="badge">
         <div id="statusDot" class="dot"></div>
@@ -253,9 +253,9 @@
     <div class="slider-card">
       <div class="slider-title">
         <span>话筒拾音增益</span>
-        <span id="micGainVal">1.5x</span>
+        <span id="micGainVal">1.0x</span>
       </div>
-      <input type="range" id="micGainSlider" class="slider" min="0.5" max="4.0" step="0.1" value="1.5">
+      <input type="range" id="micGainSlider" class="slider" min="0.5" max="4.0" step="0.1" value="1.0">
     </div>
     <div class="slider-card">
       <div class="slider-title">
@@ -337,7 +337,7 @@ const config = {
   haptic: true,
   speakerMute: false,
   urgentOverride: false,
-  micGain: 1.5,
+  micGain: 1.0,
   speakerVol: 1.0,
   maxPttSeconds: 60
 };
@@ -358,12 +358,12 @@ const MAGIC_0 = 0x49; // 'I'
 const MAGIC_1 = 0x43; // 'C'
 const HEADER_LEN = 8;
 const TARGET_SAMPLE_RATE = 16000;
-const CHUNK_SAMPLES = 2560; // 160ms 块
+const CHUNK_SAMPLES = 3200; // 200ms 黄金分包 (规避公网限流0丢包)
 let pcmAccumulator = new Int16Array(CHUNK_SAMPLES);
 let pcmAccCount = 0;
 let resamplePhase = 0.0;
 let nextPlayTime = 0;
-const JITTER_BUFFER_LEAD = 0.25;
+const JITTER_BUFFER_LEAD = 0.35; // 350ms 抗抖动缓冲池深度
 
 // DOM 引用
 const statusDot = document.getElementById("statusDot");
